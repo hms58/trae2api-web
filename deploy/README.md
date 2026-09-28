@@ -16,8 +16,8 @@ mkdir -p /opt/trae2api && cd /opt/trae2api
 
 # 2. 把 compose.yml 和 .env.example 传到这个目录（scp / sftp 均可）
 #    或者直接从 Gitee 下载这两个文件：
-curl -fLO https://gitee.com/qiyuess/trae2api-web/raw/main/deploy/compose.yml
-curl -fLO https://gitee.com/qiyuess/trae2api-web/raw/main/deploy/.env.example
+curl -fLO https://github.com/qy743160985-spec/trae2api-web/raw/main/deploy/compose.yml
+curl -fLO https://github.com/qy743160985-spec/trae2api-web/raw/main/deploy/.env.example
 
 # 3. 生成 .env（随机 32 字节 key，别用 changeme）
 cp .env.example .env
