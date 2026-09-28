@@ -1,6 +1,6 @@
 services:
   tw2api:
-    image: ghcr.io/qy743160985-spec/trae2api-web:latest
+    image: ghcr.io/qiyuess/trae2api-web:latest
     container_name: trae2api-web
     restart: unless-stopped
     environment:
