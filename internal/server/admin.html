@@ -99,11 +99,11 @@
   </header>
 
   <div class="keybar">
-    <span>API Key（写操作需）：</span>
+    <span>API Key：</span>
     <input id="apikey" type="password" placeholder="TW2A_API_KEY（写操作必填，点「记忆」保存）" oninput="onKeyChange()">
     <button class="btn sm" onclick="saveKey()">保存</button>
     <span id="keystatus" class="saved" style="display:none">已记忆</span>
-    <span style="margin-left:auto;font-size:11px">列表/额度为只读；导入/删除/开关/登录需 Key</span>
+    <span style="margin-left:auto;font-size:11px">所有管理接口均需 Key，与 API 调用共用</span>
   </div>
 
   <div class="tabs">
@@ -188,7 +188,12 @@ function refreshActive(){ if(activeTab==='accounts') loadAccounts(); else loadCr
 /* ─── 账号管理 ─── */
 async function loadAccounts(){
   try{
-    const r = await fetch('/admin/api/accounts', {cache:'no-store'});
+    const r = await fetch('/admin/api/accounts', {cache:'no-store', headers: authHeader()});
+    if(r.status === 401){
+      document.getElementById('acctTable').innerHTML =
+        '<div style="color:var(--warn);padding:14px">请先在顶部输入 API Key（与 API 调用共用的 TW2A_API_KEY），点「保存」后刷新。</div>';
+      return;
+    }
     const d = await r.json();
     renderAccounts(d.accounts||[]);
     document.getElementById('ts').textContent = '更新于 ' + new Date().toLocaleTimeString();
@@ -255,7 +260,8 @@ async function deleteAcct(uid){
   loadAccounts();
 }
 async function showJSON(uid){
-  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store'});
+  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store', headers: authHeader()});
+  if(!r.ok){ const e = await r.json().catch(()=>({})); alert('获取失败：'+apiErr(e)); return; }
   const d = await r.json();
   document.getElementById('modalTitle').textContent = '凭证预览（脱敏）— '+(d.nickname||d.uid);
   document.getElementById('modalBody').textContent = JSON.stringify(d, null, 2);
@@ -310,7 +316,7 @@ function pollLogin(pid){
     waited += 2;
     if(waited > 180){ clearInterval(loginPollTimer); st.className='login-status err'; st.textContent='登录超时（3分钟），请重试'; document.getElementById('loginBtn').disabled=false; return; }
     try{
-      const r = await fetch('/admin/api/login/result?pending_id='+encodeURIComponent(pid), {cache:'no-store'});
+      const r = await fetch('/admin/api/login/result?pending_id='+encodeURIComponent(pid), {cache:'no-store', headers: authHeader()});
       const d = await r.json();
       if(d.state==='success'){
         clearInterval(loginPollTimer);
@@ -362,7 +368,12 @@ function renderCredits(d){
 }
 async function loadCredits(){
   try{
-    const r = await fetch('/admin/api/credits', {cache:'no-store'});
+    const r = await fetch('/admin/api/credits', {cache:'no-store', headers: authHeader()});
+    if(r.status === 401){
+      document.getElementById('grid').innerHTML =
+        '<div style="color:var(--warn)">请先在顶部输入 API Key 后刷新。</div>';
+      return;
+    }
     renderCredits(await r.json());
   }catch(e){
     document.getElementById('grid').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';

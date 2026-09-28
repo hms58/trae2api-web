@@ -314,6 +314,47 @@ func TestAPIKeyAuthCaseInsensitivePrefix(t *testing.T) {
 	}
 }
 
+// TestAdminEndpointsRequireKey 管理面板所有数据接口共用 TW2A_API_KEY 鉴权。
+func TestAdminEndpointsRequireKey(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "test-key",
+	})
+	// 面板页面本身可匿名获取（不含数据），数据接口全部 401。
+	for _, path := range []string{
+		"/admin/api/accounts",
+		"/admin/api/credits",
+		"/admin/api/accounts/u1/json",
+		"/admin/api/login/result?pending_id=none",
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 401 {
+			t.Errorf("no key GET %s: code=%d want 401", path, rec.Code)
+		}
+	}
+	// 正确 key → 200。
+	for _, path := range []string{
+		"/admin/api/accounts",
+		"/admin/api/accounts/u1/json",
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Errorf("right key GET %s: code=%d want 200", path, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/admin", nil))
+	if rec.Code != 200 {
+		t.Errorf("admin page: code=%d", rec.Code)
+	}
+}
+
 func TestStatusEndpoint(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
 	p.SetCredits("u1", 42)

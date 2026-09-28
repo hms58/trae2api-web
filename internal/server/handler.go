@@ -73,21 +73,21 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
-	// 管理面板：本地面板
-	// 读接口无鉴权（局域网内只读）；写接口（accounts 写/login/refresh/authorize）
-	// 经 withAdminAuth 校验 Bearer = TW2A_API_KEY（见 §4 安全设计）。
+	// 管理面板：全部接口（页面 + 读 + 写）共用 TW2A_API_KEY 鉴权。
+	// 页面本身不返回任何凭证数据，允许匿名获取；进入页面后所有数据接口
+	// 均需 Bearer API Key（与 /v1 API 同一把 key）。
 	h.mux.HandleFunc("GET /admin", h.adminPage)
-	h.mux.HandleFunc("GET /admin/api/credits", h.adminCredits)
+	h.mux.HandleFunc("GET /admin/api/credits", h.withAdminAuth(h.adminCredits))
 	// 账号 CRUD
-	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)
+	h.mux.HandleFunc("GET /admin/api/accounts", h.withAdminAuth(h.adminAccounts))
 	h.mux.HandleFunc("POST /admin/api/accounts/import", h.withAdminAuth(h.adminImportAccount))
 	h.mux.HandleFunc("DELETE /admin/api/accounts/{uid}", h.withAdminAuth(h.adminDeleteAccount))
 	h.mux.HandleFunc("PATCH /admin/api/accounts/{uid}", h.withAdminAuth(h.adminPatchAccount))
 	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/refresh", h.withAdminAuth(h.adminRefreshAccount))
-	h.mux.HandleFunc("GET /admin/api/accounts/{uid}/json", h.adminAccountJSON)
+	h.mux.HandleFunc("GET /admin/api/accounts/{uid}/json", h.withAdminAuth(h.adminAccountJSON))
 	// Web 登录闭环
 	h.mux.HandleFunc("POST /admin/api/login", h.withAdminAuth(h.adminLoginStart))
-	h.mux.HandleFunc("GET /admin/api/login/result", h.adminLoginResult)
+	h.mux.HandleFunc("GET /admin/api/login/result", h.withAdminAuth(h.adminLoginResult))
 	h.mux.HandleFunc("POST /admin/api/login/cancel", h.withAdminAuth(h.adminLoginCancel))
 	// TRAE 回调落点（/authorize）：无需 Bearer（TRAE 浏览器 302 不带 key），
 	// 仅捕获 query 写 pending 队列，不直接落盘 token。
