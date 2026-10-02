@@ -96,11 +96,22 @@ jobs:
           go build -o "dist/${filename}" "${{ matrix.cmd }}"
           echo "filename=${filename}" >> "$GITHUB_OUTPUT"
 
+      - name: Compress binary
+        id: compress
+        shell: bash
+        run: |
+          cd dist
+          filename="${{ steps.build.outputs.filename }}"
+          archive="${filename}.tar.gz"
+          tar -czf "${archive}" "${filename}"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          rm "${filename}"
+
       - name: Upload to GitHub Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ steps.build.outputs.filename }}
+          files: dist/${{ steps.compress.outputs.archive }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -109,5 +120,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/${{ steps.build.outputs.filename }}
+          path: dist/${{ steps.compress.outputs.archive }}
           retention-days: 7
