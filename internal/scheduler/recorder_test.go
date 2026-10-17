@@ -70,6 +70,37 @@ func TestRecorderBadLinesTolerated(t *testing.T) {
 	}
 }
 
+// 父目录不存在（如 ./data）时自动创建，记录正常落盘。
+func TestRecorderCreatesMissingDataDir(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data", "nested", "schedule-log.jsonl")
+	r := NewRecorder(path, 0)
+	r.Add(Record{StartedAt: time.Now().Format(timeLayout), Task: "refresh", Result: "success", DurationMS: 10, Summary: "startup"})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("file should exist after Add: %v", err)
+	}
+	if !strings.Contains(string(raw), "startup") {
+		t.Errorf("record missing in file: %s", raw)
+	}
+}
+
+// 空池不执行任务、不产生记录（启动补跑/定时到点均如此）。
+func TestEmptyPoolSkipsTasksAndRecords(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	s := newTestScheduler(f, pool.New(""), srv)
+	s.RunRefreshNow()
+	s.RunCheckinNow()
+	if got := len(s.Records()); got != 0 {
+		t.Errorf("empty pool should produce no records, got %d", got)
+	}
+	if f.refreshCalls.Load() != 0 || f.checkinCalls.Load() != 0 {
+		t.Error("empty pool should not call upstream")
+	}
+}
+
 func TestSchedulerUpdateHotReload(t *testing.T) {
 	s := New(Config{})
 	s.UpdateRuntime(ScheduleRuntime{CheckinEnabled: false, CheckinHour: 21, RefreshHours: []int{5, 15}, JitterMinutes: 7})

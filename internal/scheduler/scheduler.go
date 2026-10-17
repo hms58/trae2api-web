@@ -219,8 +219,12 @@ func (s *Scheduler) rescanAuths() {
 
 // RunCheckinNow 立即对所有账号执行签到 + 积分刷新 + 解冻。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用/软关闭的跳过。
+// 空池直接跳过（无意义且会产生误导性记录）。
 func (s *Scheduler) RunCheckinNow() {
 	s.rescanAuths()
+	if s.cfg.Pool.Count() == 0 {
+		return
+	}
 	start := time.Now()
 	summary, result := s.doCheckin()
 	s.record("checkin", start, result, summary)
@@ -284,8 +288,12 @@ func (s *Scheduler) doCheckin() (summary, result string) {
 
 // RunRefreshNow 立即对所有账号刷新 token（保活）。
 // 硬禁用账号同样尝试 refresh：成功 = 凭证有效 → 复活；失败保持禁用。
+// 空池直接跳过（无意义且会产生误导性记录）。
 func (s *Scheduler) RunRefreshNow() {
 	s.rescanAuths()
+	if s.cfg.Pool.Count() == 0 {
+		return
+	}
 	start := time.Now()
 	summary, result := s.doRefresh()
 	s.record("refresh", start, result, summary)

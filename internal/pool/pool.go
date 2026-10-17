@@ -108,9 +108,11 @@ func (p *Pool) Add(a *auth.Auth) {
 		return
 	}
 	p.byUID[a.UID] = &entry{a: a, enabled: true}
+	p.saveLocked()
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
+// 对齐后落盘一次，保证账号集合变化即时反映到 state.json。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -128,6 +130,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			delete(p.byUID, uid)
 		}
 	}
+	p.saveLocked()
 }
 
 // Remove 删除账号（仅清内存索引与 state.json 条目；auths/trae-{uid}.json 由调用方删）。
@@ -302,6 +305,13 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 		return e.a
 	}
 	return nil
+}
+
+// Count 返回账号数量（空池快速跳过定时任务用）。
+func (p *Pool) Count() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.byUID)
 }
 
 // List 返回所有账号状态（按 UID 排序，稳定输出）。

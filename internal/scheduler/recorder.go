@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -137,10 +138,13 @@ func (r *Recorder) SetRetention(days int) {
 	}
 }
 
-// appendLine 追加一行 JSON（O_APPEND，并发追加安全）。
+// appendLine 追加一行 JSON（O_APPEND，并发追加安全）；父目录不存在时自动创建。
 func appendLine(path string, rec Record) error {
 	raw, err := json.Marshal(rec)
 	if err != nil {
+		return err
+	}
+	if err := ensureDir(path); err != nil {
 		return err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -154,10 +158,21 @@ func appendLine(path string, rec Record) error {
 	return nil
 }
 
+// ensureDir 确保文件父目录存在（如 ./data 不存在则创建）。
+func ensureDir(path string) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		return os.MkdirAll(dir, 0o755)
+	}
+	return nil
+}
+
 // rewrite 用内存记录全量重写文件（裁剪后调用）。调用方需持锁。
 func (r *Recorder) rewrite() error {
 	if r.path == "" {
 		return nil
+	}
+	if err := ensureDir(r.path); err != nil {
+		return err
 	}
 	tmp := r.path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
