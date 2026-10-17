@@ -34,16 +34,20 @@ type Config struct {
 		RefreshHours  []int  `json:"refresh_hours"`  // [3]
 		RetentionDays int    `json:"retention_days"` // 执行记录保留天数，默认 30，0 = 永久
 		LogFile       string `json:"log_file"`       // 执行记录文件（JSONL），默认 ./data/schedule-log.jsonl
+		CheckinEnabled *bool `json:"checkin_enabled"` // 签到开关，缺省 true
+		JitterMinutes  *int  `json:"jitter_minutes"`  // 触发随机抖动分钟数，缺省 10；0 = 准点，上限 30
 	} `json:"schedule"`
 
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 120
 	} `json:"upstream"`
 
-	// 解析后的 duration。
-	PlanCreditDur  time.Duration `json:"-"`
-	SoftRateDur    time.Duration `json:"-"`
-	ErrCooldownDur time.Duration `json:"-"`
+	// 解析后的 duration / schedule 运行值。
+	PlanCreditDur         time.Duration `json:"-"`
+	SoftRateDur           time.Duration `json:"-"`
+	ErrCooldownDur        time.Duration `json:"-"`
+	ScheduleCheckinEnable bool          `json:"-"` // CheckinEnabled 解析值（缺省 true）
+	ScheduleJitterMinutes int           `json:"-"` // JitterMinutes 解析值（缺省 10，封顶 30）
 }
 
 // Default 返回默认配置。
@@ -166,6 +170,21 @@ func (c *Config) normalize() error {
 	if c.CallbackPort == "" {
 		c.CallbackPort = "18080"
 	}
+	// Schedule 解析值：缺省签到开、抖动 10 分钟；显式 0 = 关闭抖动
+	c.ScheduleCheckinEnable = true
+	if c.Schedule.CheckinEnabled != nil {
+		c.ScheduleCheckinEnable = *c.Schedule.CheckinEnabled
+	}
+	c.ScheduleJitterMinutes = 10
+	if c.Schedule.JitterMinutes != nil {
+		c.ScheduleJitterMinutes = *c.Schedule.JitterMinutes
+	}
+	if c.ScheduleJitterMinutes < 0 {
+		c.ScheduleJitterMinutes = 0
+	}
+	if c.ScheduleJitterMinutes > 30 {
+		c.ScheduleJitterMinutes = 30
+	}
 	return nil
 }
 
@@ -194,6 +213,8 @@ func patchConfigFile(path string, s server.EditableSettings) error {
 	copy(rh, s.RefreshHours)
 	sched["refresh_hours"] = rh
 	sched["retention_days"] = s.RetentionDays
+	sched["checkin_enabled"] = s.CheckinEnabled
+	sched["jitter_minutes"] = s.JitterMinutes
 	up, _ := doc["upstream"].(map[string]any)
 	if up == nil {
 		up = map[string]any{}

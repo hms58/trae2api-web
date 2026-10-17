@@ -80,6 +80,8 @@
   .settings-grid label { display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--dim); }
   .settings-grid input { background:var(--card2); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
                          padding:7px 10px; font-size:13px; width:100%; }
+  .settings-grid label.chk { flex-direction:row; align-items:center; gap:8px; font-size:13px; color:var(--fg); }
+  .settings-grid label.chk input { width:16px; height:16px; accent-color:var(--accent); }
   /* modal */
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
   .modal-bg.show { display:flex; }
@@ -164,8 +166,10 @@
     <div class="login-bar">
       <h2>运行配置（保存后立即生效并写回 config.json）</h2>
       <div class="settings-grid">
+        <label class="chk"><input id="setCheckinEnabled" type="checkbox"> 启用每日签到</label>
         <label>签到小时（0-23）<input id="setCheckinHour" type="number" min="0" max="23"></label>
         <label>预刷新小时（逗号分隔，如 3,15）<input id="setRefreshHours" type="text" placeholder="3,15"></label>
+        <label>触发随机抖动（分钟，0=准点，上限30）<input id="setJitterMinutes" type="number" min="0" max="30"></label>
         <label>上游超时（秒，5-3600）<input id="setTimeoutSeconds" type="number" min="5" max="3600"></label>
         <label>记录保留天数（0=永久）<input id="setRetentionDays" type="number" min="0" max="3650"></label>
       </div>
@@ -243,8 +247,10 @@ async function loadSettings(){
       return;
     }
     const d = await r.json();
+    document.getElementById('setCheckinEnabled').checked = !!d.checkin_enabled;
     document.getElementById('setCheckinHour').value = d.checkin_hour;
     document.getElementById('setRefreshHours').value = (d.refresh_hours||[]).join(',');
+    document.getElementById('setJitterMinutes').value = d.jitter_minutes;
     document.getElementById('setTimeoutSeconds').value = d.timeout_seconds;
     document.getElementById('setRetentionDays').value = d.retention_days;
   }catch(e){
@@ -259,8 +265,10 @@ async function saveSettings(){
   const rh = document.getElementById('setRefreshHours').value.split(',')
     .map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n));
   const body = {
+    checkin_enabled: document.getElementById('setCheckinEnabled').checked,
     checkin_hour: parseInt(document.getElementById('setCheckinHour').value,10),
     refresh_hours: rh,
+    jitter_minutes: parseInt(document.getElementById('setJitterMinutes').value,10),
     timeout_seconds: parseInt(document.getElementById('setTimeoutSeconds').value,10),
     retention_days: parseInt(document.getElementById('setRetentionDays').value,10)
   };
@@ -336,10 +344,11 @@ function renderAccounts(accts){
     else if(!a.enabled) badges += badge('已停用','b-warn');
     else if(a.cooling) badges += badge('冷却','b-warn');
     else badges += badge('正常','b-ok');
-    if(a.expired_soon) badges += badge('token将过期','b-warn');
+    const expired = a.expires_at > 0 && a.expires_at <= Date.now()/1000;
+    if(expired) badges += badge('token已过期','b-bad');
+    else if(a.expired_soon) badges += badge('token将过期','b-warn');
     const exp = a.expires_at ? new Date(a.expires_at*1000).toLocaleString() : '-';
     const toggleChecked = a.enabled && !a.disabled ? 'checked' : '';
-    const toggleDisabled = a.disabled ? 'disabled' : '';
     return '<tr>'
       + '<td><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid mono">'+esc(a.uid)+'</div></td>'
@@ -348,7 +357,7 @@ function renderAccounts(accts){
       + '<td class="mono">'+esc(exp)+'</td>'
       + '<td class="mono">'+esc(a.machine_id||'-')+' / '+esc(a.device_id||'-')+'</td>'
       + '<td><div class="row-actions">'
-      + '<label class="toggle"><input type="checkbox" '+toggleChecked+' '+toggleDisabled+' onchange="toggleAcct(\''+esc(a.uid)+'\', this.checked)"><span class="slider"></span></label>'
+      + '<label class="toggle"><input type="checkbox" '+toggleChecked+' onchange="toggleAcct(\''+esc(a.uid)+'\', this.checked, '+!!a.disabled+')"><span class="slider"></span></label>'
       + '<button class="btn sm" onclick="refreshAcct(\''+esc(a.uid)+'\')">刷新token</button>'
       + '<button class="btn sm" onclick="showJSON(\''+esc(a.uid)+'\')">JSON</button>'
       + '<button class="btn sm danger" onclick="deleteAcct(\''+esc(a.uid)+'\')">删除</button>'
@@ -359,7 +368,9 @@ function renderAccounts(accts){
     + '<th>账号</th><th>状态</th><th>积分</th><th>Token 有效期</th><th>机器/设备(前8)</th><th style="text-align:right">操作</th>'
     + '</tr></thead><tbody>'+rows+'</tbody></table>';
 }
-async function toggleAcct(uid, enabled){
+async function toggleAcct(uid, enabled, wasDisabled){
+  // 禁用账号重新启用 = 服务端会先用 refreshToken 探测，成功才复活
+  if(enabled && wasDisabled && !confirm('账号当前为 session dead 禁用。\n启用将立即用 refreshToken 刷新验证：成功则复活，失败保持禁用。继续？')) return;
   const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid), {
     method:'PATCH', headers:{'Content-Type':'application/json', ...authHeader()},
     body: JSON.stringify({enabled: enabled})

@@ -28,6 +28,9 @@ func TestSettingsStoreUpdateValidation(t *testing.T) {
 	if err := s.Update(EditableSettings{CheckinHour: 9, RefreshHours: []int{3, 3}, TimeoutSeconds: 120, RetentionDays: 30}); err == nil {
 		t.Fatal("duplicate hours should fail")
 	}
+	if err := s.Update(EditableSettings{CheckinHour: 9, RefreshHours: []int{3}, TimeoutSeconds: 120, RetentionDays: 30, JitterMinutes: 31}); err == nil {
+		t.Fatal("jitter_minutes=31 should fail")
+	}
 	if got := s.Get(); got.CheckinHour != 9 || got.TimeoutSeconds != 120 {
 		t.Errorf("current mutated after failed updates: %+v", got)
 	}

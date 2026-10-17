@@ -227,6 +227,23 @@ func (p *Pool) Disable(uid, reason string) {
 	p.saveLocked()
 }
 
+// Revive 复活硬禁用账号（refresh 成功验证凭证后调用）：
+// 清除 disabled/reason/until/errCount，账号重新参与调度。
+func (p *Pool) Revive(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.disabled = false
+	e.reason = ""
+	e.until = time.Time{}
+	e.errCount = 0
+	p.saveLocked()
+	return true
+}
+
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()

@@ -14,16 +14,21 @@ import (
 
 // EditableSettings 页面可编辑配置（config.json schedule/upstream 段的运行时视图）。
 type EditableSettings struct {
+	CheckinEnabled bool  `json:"checkin_enabled"` // 签到开关，默认 true
 	CheckinHour    int   `json:"checkin_hour"`    // 签到小时 0-23
 	RefreshHours   []int `json:"refresh_hours"`   // token 预刷新小时列表
 	TimeoutSeconds int   `json:"timeout_seconds"` // 上游超时（秒），含首字节兜底
 	RetentionDays  int   `json:"retention_days"`  // 执行记录保留天数，0 = 永久
+	JitterMinutes  int   `json:"jitter_minutes"`  // 触发随机抖动分钟数，0 = 准点，上限 30
 }
 
 // validateSettings 校验可编辑配置的合法性与取值范围。
 func validateSettings(v EditableSettings) error {
 	if v.CheckinHour < 0 || v.CheckinHour > 23 {
 		return fmt.Errorf("checkin_hour 取值 0-23，当前 %d", v.CheckinHour)
+	}
+	if v.JitterMinutes < 0 || v.JitterMinutes > 30 {
+		return fmt.Errorf("jitter_minutes 取值 0-30（0 = 准点），当前 %d", v.JitterMinutes)
 	}
 	if len(v.RefreshHours) == 0 {
 		return fmt.Errorf("refresh_hours 不能为空")

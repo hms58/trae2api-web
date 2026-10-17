@@ -260,13 +260,38 @@ func (h *Handler) adminPatchAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Enabled != nil {
-		reason := "user enabled"
-		if !*req.Enabled {
-			reason = "user disabled"
-		}
-		if !h.cfg.Pool.SetEnabled(uid, *req.Enabled, reason) {
-			writeOpenAIError(w, http.StatusNotFound, "not_found", "account vanished")
-			return
+		if *req.Enabled {
+			// 硬禁用账号重新启用 → 先用 refreshToken 探测凭证有效性，成功才复活；
+			// 失败保持禁用并返回原因（页面可见），避免"开了开关但永远不被调度"的自洽漏洞。
+			if st.Disabled {
+				a := h.cfg.Pool.AuthByUID(uid)
+				if a == nil {
+					writeOpenAIError(w, http.StatusNotFound, "not_found", "no auth for uid")
+					return
+				}
+				if err := h.cfg.Upstream.RefreshToken(a); err != nil {
+					writeOpenAIError(w, http.StatusBadGateway, "revive_failed",
+						"refresh failed（凭证仍无效，账号保持禁用）: "+err.Error())
+					return
+				}
+				if a.FilePath == "" {
+					a.FilePath = auth.FilePathFor(h.cfg.AuthDir, uid)
+				}
+				if err := a.SaveAtomic(); err != nil {
+					writeOpenAIError(w, http.StatusInternalServerError, "save_failed", err.Error())
+					return
+				}
+				h.cfg.Pool.Revive(uid)
+			}
+			if !h.cfg.Pool.SetEnabled(uid, true, "user enabled") {
+				writeOpenAIError(w, http.StatusNotFound, "not_found", "account vanished")
+				return
+			}
+		} else {
+			if !h.cfg.Pool.SetEnabled(uid, false, "user disabled") {
+				writeOpenAIError(w, http.StatusNotFound, "not_found", "account vanished")
+				return
+			}
 		}
 	}
 	_ = st // nickname 更新需要改 auth 文件
@@ -287,6 +312,7 @@ func (h *Handler) adminPatchAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminRefreshAccount POST /admin/api/accounts/{uid}/refresh：手动 ExchangeToken + 落盘。
+// 账号处于硬禁用（session dead）时刷新成功 = 凭证已验证有效 → 自动复活。
 func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := h.cfg.Pool.AuthByUID(uid)
@@ -294,6 +320,7 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "no auth for uid")
 		return
 	}
+	wasDisabled, _ := h.cfg.Pool.Status(uid)
 	if err := h.cfg.Upstream.RefreshToken(a); err != nil {
 		// session 失效 → 硬禁用（与 chat 路径一致）
 		if isSessionDeadErr(err) {
@@ -309,11 +336,14 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "save_failed", err.Error())
 		return
 	}
+	if wasDisabled.Disabled {
+		h.cfg.Pool.Revive(uid)
+	}
 	st, _ := h.cfg.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"uid":       uid,
+		"uid":        uid,
 		"expires_at": a.ExpiresAt,
-		"status":    st,
+		"status":     st,
 	})
 }
 

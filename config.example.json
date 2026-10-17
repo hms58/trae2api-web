@@ -10,8 +10,10 @@
     "err_cooldown": "10m"
   },
   "schedule": {
+    "checkin_enabled": true,
     "checkin_hour": 9,
     "refresh_hours": [3],
+    "jitter_minutes": 10,
     "retention_days": 30,
     "log_file": "./data/schedule-log.jsonl"
   },
