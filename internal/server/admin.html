@@ -134,6 +134,7 @@
     <div class="tab active" onclick="switchTab('accounts',this)">账号管理</div>
     <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
     <div class="tab" onclick="switchTab('sched',this)">定时任务</div>
+    <div class="tab" onclick="switchTab('models',this)">模型列表</div>
   </div>
 
   <!-- 账号管理 -->
@@ -179,6 +180,20 @@
       </div>
     </div>
     <div id="schedLogTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
+  </div>
+
+  <!-- 模型列表 -->
+  <div id="pane-models" class="pane">
+    <div class="login-bar">
+      <h2>全局模型列表</h2>
+      <div class="meta" id="modelsMeta" style="margin-top:2px"></div>
+      <div class="imp-row">
+        <button class="btn" onclick="loadModels()">刷新</button>
+        <input id="modelFilter" type="text" placeholder="筛选模型名..." oninput="renderModels()"
+               style="background:var(--card2);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:7px 10px;font-size:13px;flex:1;min-width:160px">
+      </div>
+    </div>
+    <div id="modelTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
   </div>
 </div>
 
@@ -232,6 +247,50 @@ function refreshActive(){
   if(activeTab==='accounts') loadAccounts();
   else if(activeTab==='credits') loadCredits();
   else if(activeTab==='sched') loadSched();
+  else if(activeTab==='models') loadModels();
+}
+
+/* ─── 模型列表 ─── */
+let modelsData = {models:[]};
+async function loadModels(){
+  const el = document.getElementById('modelTable');
+  try{
+    const r = await fetch('/admin/api/models', {cache:'no-store', headers: authHeader()});
+    if(r.status === 401){
+      el.innerHTML = '<div style="color:var(--warn);padding:14px">请先在顶部输入 API Key 后刷新。</div>';
+      return;
+    }
+    modelsData = await r.json();
+    const d = modelsData;
+    const meta = document.getElementById('modelsMeta');
+    let m = '<span>来源 <b>'+(d.source==='dynamic'?'动态（上游 get_detail_param）':'静态兜底表')+'</b></span>'
+      + '<span>数量 <b>'+(d.count||0)+'</b></span>'
+      + '<span>默认模型 <b>'+esc(d.default||'-')+'</b></span>';
+    if(d.source==='dynamic' && d.fetched_at) m += '<span>缓存时间 <b>'+esc(d.fetched_at)+'</b>（TTL '+esc(d.ttl||'')+'）</span>';
+    if(d.last_fail_at) m += '<span style="color:var(--bad)">最近失败 <b>'+esc(d.last_fail_at)+'</b>（负缓存 '+esc(d.fail_cooldown||'')+'）</span>';
+    meta.innerHTML = m;
+    renderModels();
+  }catch(e){
+    el.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+  }
+}
+function renderModels(){
+  const el = document.getElementById('modelTable');
+  const kw = (document.getElementById('modelFilter').value||'').trim().toLowerCase();
+  const list = (modelsData.models||[]).filter(m => !kw || String(m.id).toLowerCase().includes(kw));
+  if(!list.length){
+    el.innerHTML = '<div style="color:var(--dim);padding:14px">'+(kw?'无匹配模型':'暂无模型')+'</div>';
+    return;
+  }
+  const def = modelsData.default;
+  const rows = list.map(m=>'<tr>'
+    + '<td class="mono">'+esc(m.id)+(m.id===def?' '+badge('默认','b-ok'):'')+'</td>'
+    + '<td class="mono">'+fmt(m.context_length)+'</td>'
+    + '<td class="mono">'+esc(m.owned_by||'-')+'</td>'
+    + '</tr>').join('');
+  el.innerHTML = '<table class="accts"><thead><tr>'
+    + '<th>模型 ID（config_name）</th><th>上下文长度</th><th>owner</th>'
+    + '</tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
 /* ─── 定时任务：配置 + 执行记录 ─── */
@@ -353,7 +412,7 @@ function renderAccounts(accts){
       + '<td><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid mono">'+esc(a.uid)+'</div></td>'
       + '<td>'+badges+(a.reason?'<div class="mono" style="margin-top:4px">'+esc(a.reason)+'</div>':'')+'</td>'
-      + '<td class="mono">'+fmt(a.credits)+'</td>'
+      + '<td class="mono">'+fmt(a.credits)+(a.credits_error?'<div class="mono" style="color:var(--bad)" title="'+esc(a.credits_error)+'">查询失败</div>':'')+'</td>'
       + '<td class="mono">'+esc(exp)+'</td>'
       + '<td class="mono">'+esc(a.machine_id||'-')+' / '+esc(a.device_id||'-')+'</td>'
       + '<td><div class="row-actions">'
@@ -365,7 +424,7 @@ function renderAccounts(accts){
       + '</tr>';
   }).join('');
   el.innerHTML = '<table class="accts"><thead><tr>'
-    + '<th>账号</th><th>状态</th><th>积分</th><th>Token 有效期</th><th>机器/设备(前8)</th><th style="text-align:right">操作</th>'
+    + '<th>账号</th><th>状态</th><th>剩余积分</th><th>Token 有效期</th><th>机器/设备(前8)</th><th style="text-align:right">操作</th>'
     + '</tr></thead><tbody>'+rows+'</tbody></table>';
 }
 async function toggleAcct(uid, enabled, wasDisabled){
