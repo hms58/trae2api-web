@@ -211,6 +211,43 @@ func TestStreamToolCallsStopOverriddenToToolCalls(t *testing.T) {
 	}
 }
 
+// 流内业务错误必须以 OpenAI 错误 data 块透出（客户端可见），而非自定义 event 行被静默吞掉。
+func TestStreamErrorEmitsOpenAIErrorData(t *testing.T) {
+	rec := httptest.NewRecorder()
+	raw := "event:output\ndata:{\"response\":\"part\",\"reasoning_content\":\"\",\"tool_calls\":null}\n\n" +
+		"event:error\ndata:{\"code\":4011,\"message\":\"rate limited\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"error"`) || !strings.Contains(body, "4011") {
+		t.Errorf("error should surface as OpenAI error data: %q", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Errorf("custom event line should be gone: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE]: %q", body)
+	}
+}
+
+// 上游未发 done 就断流：兜底 [DONE] 前先透出错误块，客户端可见中断原因。
+func TestStreamEOFWithoutDoneEmitsErrorData(t *testing.T) {
+	rec := httptest.NewRecorder()
+	raw := "event:output\ndata:{\"response\":\"partial\",\"reasoning_content\":\"\",\"tool_calls\":null}\n\n"
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"error"`) || !strings.Contains(body, "without done event") {
+		t.Errorf("EOF cut should surface error data: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE]: %q", body)
+	}
+}
+
 func TestStreamNoToolCallsKeepsStop(t *testing.T) {
 	rec := httptest.NewRecorder()
 	if err := Stream(rec, strings.NewReader(soloSSEFixture)); err != nil {

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -374,9 +375,33 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		return nil
 	}
 
+	// writeErrData 写一条 OpenAI 风格的错误 data 块（标准客户端可识别并展示），
+	// 取代此前客户端无法识别的 "event: error" 自定义行——那会让流内错误被静默吞掉，
+	// 表现为"任务未结束就中断"且无任何报错。
+	writeErrData := func(msg string) error {
+		payload := map[string]any{
+			"error": map[string]any{
+				"message": msg,
+				"type":    "upstream_error",
+				"code":    "solo_stream_error",
+			},
+		}
+		raw, _ := json.Marshal(payload)
+		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
+			return err
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
+
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
+			// 上游传输层中断：显式记录 + OpenAI 错误块收尾，不再静默。
+			log.Printf("solo stream: upstream read error: %v", err)
+			_ = writeErrData(fmt.Sprintf("upstream read error: %v", err))
 			return err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
@@ -430,13 +455,15 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 				}
 				sawDone = true
 			case "error":
-				// 上游业务错误：回调 + 写一条 error 事件 + [DONE]。
+				// 上游业务错误（4001 参数/4008 配额/4011 频率等）：回调冷却 + 记日志 +
+				// OpenAI 错误块收尾，客户端可看到明确报错而非静默中断。
 				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
 				if onErr != nil {
 					onErr(se)
 				}
 				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
-				if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(msg)+"\n\n"); err != nil {
+				log.Printf("solo stream: %s", msg)
+				if err := writeErrData(msg); err != nil {
 					return err
 				}
 				if err := writeDONE(); err != nil {
@@ -450,13 +477,11 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		}
 	}
 	if !sawDone {
-		// 幂等兜底：上游中断（无 done）仍写 [DONE]。
+		// 上游未发 done 就断流（网关空闲超时/连接被切）：记日志 + 错误块，
+		// 仍兜底 [DONE] 保证流闭合，但客户端能看到中断原因。
+		log.Printf("solo stream: upstream closed without done event")
+		_ = writeErrData("upstream closed stream without done event")
 		return writeDONE()
 	}
 	return nil
-}
-
-func jsonEscape(s string) string {
-	raw, _ := json.Marshal(s)
-	return string(raw)
 }
