@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"trae2api-web/internal/server"
 )
 
 // Config 顶层配置。
@@ -28,8 +30,10 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Schedule struct {
-		CheckinHour  int   `json:"checkin_hour"`  // 9
-		RefreshHours []int `json:"refresh_hours"` // [3]
+		CheckinHour   int    `json:"checkin_hour"`   // 9
+		RefreshHours  []int  `json:"refresh_hours"`  // [3]
+		RetentionDays int    `json:"retention_days"` // 执行记录保留天数，默认 30，0 = 永久
+		LogFile       string `json:"log_file"`       // 执行记录文件（JSONL），默认 ./data/schedule-log.jsonl
 	} `json:"schedule"`
 
 	Upstream struct {
@@ -58,6 +62,8 @@ func Default() *Config {
 	c.Cooldown.ErrCooldown = "10m"
 	c.Schedule.CheckinHour = 9
 	c.Schedule.RefreshHours = []int{3}
+	c.Schedule.RetentionDays = 30
+	c.Schedule.LogFile = "./data/schedule-log.jsonl"
 	c.Upstream.TimeoutSeconds = 120
 	return c
 }
@@ -161,4 +167,46 @@ func (c *Config) normalize() error {
 		c.CallbackPort = "18080"
 	}
 	return nil
+}
+
+// patchConfigFile 只改写 config.json 中页面可编辑字段（schedule/upstream 段），
+// 其余字段与注释外格式尽量保留（JSON 重排不可避免，注释会丢失——Go 标准库限制）。
+// 原子写：tmp + rename。文件不存在时报错（页面保存依赖已存在的配置文件）。
+func patchConfigFile(path string, s server.EditableSettings) error {
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("config file %s not found (copy config.example.json first)", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	sched, _ := doc["schedule"].(map[string]any)
+	if sched == nil {
+		sched = map[string]any{}
+		doc["schedule"] = sched
+	}
+	sched["checkin_hour"] = s.CheckinHour
+	rh := make([]int, len(s.RefreshHours))
+	copy(rh, s.RefreshHours)
+	sched["refresh_hours"] = rh
+	sched["retention_days"] = s.RetentionDays
+	up, _ := doc["upstream"].(map[string]any)
+	if up == nil {
+		up = map[string]any{}
+		doc["upstream"] = up
+	}
+	up["timeout_seconds"] = s.TimeoutSeconds
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(out, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

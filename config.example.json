@@ -11,7 +11,9 @@
   },
   "schedule": {
     "checkin_hour": 9,
-    "refresh_hours": [3]
+    "refresh_hours": [3],
+    "retention_days": 30,
+    "log_file": "./data/schedule-log.jsonl"
   },
   "upstream": {
     "timeout_seconds": 120

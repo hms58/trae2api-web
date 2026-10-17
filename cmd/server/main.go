@@ -44,12 +44,34 @@ func main() {
 	}
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:         p,
-		Upstream:     up,
-		CheckinHour:  cfg.Schedule.CheckinHour,
-		RefreshHours: cfg.Schedule.RefreshHours,
-		RefreshSkew:  24 * time.Hour,
+		Pool:          p,
+		Upstream:      up,
+		CheckinHour:   cfg.Schedule.CheckinHour,
+		RefreshHours:  cfg.Schedule.RefreshHours,
+		RefreshSkew:   24 * time.Hour,
+		LogFile:       cfg.Schedule.LogFile,
+		RetentionDays: cfg.Schedule.RetentionDays,
 	})
+
+	// 页面可编辑配置：运行时生效（scheduler 热更新 + upstream 超时）+ 补丁写回 config.json。
+	applySettings := func(s server.EditableSettings) error {
+		sch.Update(s.CheckinHour, s.RefreshHours)
+		sch.SetRetention(s.RetentionDays)
+		up.HTTP.Timeout = time.Duration(s.TimeoutSeconds) * time.Second
+		if tr, ok := up.StreamHTTP.Transport.(*http.Transport); ok {
+			tr.ResponseHeaderTimeout = time.Duration(s.TimeoutSeconds) * time.Second
+		}
+		return nil
+	}
+	persistSettings := func(s server.EditableSettings) error {
+		return patchConfigFile(*cfgPath, s)
+	}
+	settings := server.NewSettingsStore(server.EditableSettings{
+		CheckinHour:    cfg.Schedule.CheckinHour,
+		RefreshHours:   cfg.Schedule.RefreshHours,
+		TimeoutSeconds: cfg.Upstream.TimeoutSeconds,
+		RetentionDays:  cfg.Schedule.RetentionDays,
+	}, applySettings, persistSettings)
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -61,6 +83,8 @@ func main() {
 		ErrThreshold: cfg.Cooldown.ErrThresh,
 		ErrCooldown:  cfg.ErrCooldownDur,
 		DefaultModel: cfg.DefaultModel,
+		Settings:     settings,
+		Scheduler:    sch,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

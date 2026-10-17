@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"trae2api-web/internal/pool"
+	"trae2api-web/internal/scheduler"
 	"trae2api-web/internal/upstream"
 )
 
@@ -29,6 +30,11 @@ type Config struct {
 	ErrCooldown  time.Duration // 错误冷却，默认 10m
 	RefreshSkew  time.Duration // token 预刷新窗口，默认 24h
 	DefaultModel string        // 默认 glm-5.2
+
+	// Settings 页面可编辑配置存储（nil = 禁用配置端点）。
+	Settings *SettingsStore
+	// Scheduler 定时任务（nil = 无执行记录端点）。
+	Scheduler *scheduler.Scheduler
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -92,6 +98,10 @@ func NewHandler(cfg Config) *Handler {
 	// TRAE 回调落点（/authorize）：无需 Bearer（TRAE 浏览器 302 不带 key），
 	// 仅捕获 query 写 pending 队列，不直接落盘 token。
 	h.mux.HandleFunc("GET /authorize", h.authorizeCallback)
+	// 运行配置（schedule/upstream 段）+ 定时任务执行记录。
+	h.mux.HandleFunc("GET /admin/api/settings", h.withAdminAuth(h.adminGetSettings))
+	h.mux.HandleFunc("PATCH /admin/api/settings", h.withAdminAuth(h.adminUpdateSettings))
+	h.mux.HandleFunc("GET /admin/api/schedule/logs", h.withAdminAuth(h.adminScheduleLogs))
 	return h
 }
 

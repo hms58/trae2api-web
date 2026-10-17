@@ -75,6 +75,11 @@
                  border-radius:8px; color:var(--fg); padding:10px 12px; font-size:12px;
                  font-family:Consolas,monospace; resize:vertical; }
   .imp-row { display:flex; gap:10px; align-items:flex-start; margin-top:8px; flex-wrap:wrap; }
+  /* settings form */
+  .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin:6px 0 4px; }
+  .settings-grid label { display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--dim); }
+  .settings-grid input { background:var(--card2); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
+                         padding:7px 10px; font-size:13px; width:100%; }
   /* modal */
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
   .modal-bg.show { display:flex; }
@@ -86,6 +91,23 @@
   .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--card2); border-top-color:var(--accent);
           border-radius:50%; animation:sp .8s linear infinite; vertical-align:-2px; }
   @keyframes sp { to { transform:rotate(360deg); } }
+  /* 移动端兼容：表格容器横向滚动，窄屏收紧布局 */
+  #acctTable, #schedLogTable { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  @media (max-width:720px){
+    .wrap { padding:16px 12px 40px; }
+    h1 { font-size:18px; }
+    header { margin-bottom:12px; }
+    .tabs { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    .tab { padding:8px 12px; white-space:nowrap; }
+    table.accts { min-width:680px; }
+    table.accts th, table.accts td { padding:8px 10px; }
+    .settings-grid { grid-template-columns:1fr; }
+    .remain { font-size:26px; }
+    .card { padding:14px 14px 12px; }
+    .keybar input { flex:1; width:auto; min-width:140px; }
+    .modal { max-width:94%; padding:14px; }
+    .btn { padding:7px 12px; }
+  }
 </style>
 </head>
 <body>
@@ -109,6 +131,7 @@
   <div class="tabs">
     <div class="tab active" onclick="switchTab('accounts',this)">账号管理</div>
     <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
+    <div class="tab" onclick="switchTab('sched',this)">定时任务</div>
   </div>
 
   <!-- 账号管理 -->
@@ -134,6 +157,24 @@
   <!-- 额度监控 -->
   <div id="pane-credits" class="pane">
     <div class="grid" id="grid"><div style="color:var(--dim)"><span class="spin"></span> 切换到「账号管理」tab 查看详情，或点刷新</div></div>
+  </div>
+
+  <!-- 定时任务 -->
+  <div id="pane-sched" class="pane">
+    <div class="login-bar">
+      <h2>运行配置（保存后立即生效并写回 config.json）</h2>
+      <div class="settings-grid">
+        <label>签到小时（0-23）<input id="setCheckinHour" type="number" min="0" max="23"></label>
+        <label>预刷新小时（逗号分隔，如 3,15）<input id="setRefreshHours" type="text" placeholder="3,15"></label>
+        <label>上游超时（秒，5-3600）<input id="setTimeoutSeconds" type="number" min="5" max="3600"></label>
+        <label>记录保留天数（0=永久）<input id="setRetentionDays" type="number" min="0" max="3650"></label>
+      </div>
+      <div class="imp-row">
+        <button class="btn primary" onclick="saveSettings()">保存配置</button>
+        <span id="setStatus" class="login-status" style="display:none"></span>
+      </div>
+    </div>
+    <div id="schedLogTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
   </div>
 </div>
 
@@ -183,7 +224,89 @@ function switchTab(name, el){
   document.getElementById('pane-'+name).classList.add('active');
   refreshActive();
 }
-function refreshActive(){ if(activeTab==='accounts') loadAccounts(); else loadCredits(); }
+function refreshActive(){
+  if(activeTab==='accounts') loadAccounts();
+  else if(activeTab==='credits') loadCredits();
+  else if(activeTab==='sched') loadSched();
+}
+
+/* ─── 定时任务：配置 + 执行记录 ─── */
+async function loadSched(){
+  await Promise.all([loadSettings(), loadSchedLogs()]);
+  document.getElementById('ts').textContent = '更新于 ' + new Date().toLocaleTimeString();
+}
+async function loadSettings(){
+  try{
+    const r = await fetch('/admin/api/settings', {cache:'no-store', headers: authHeader()});
+    if(r.status === 401){
+      document.getElementById('schedLogTable').innerHTML = '<div style="color:var(--warn);padding:14px">请先在顶部输入 API Key 后刷新。</div>';
+      return;
+    }
+    const d = await r.json();
+    document.getElementById('setCheckinHour').value = d.checkin_hour;
+    document.getElementById('setRefreshHours').value = (d.refresh_hours||[]).join(',');
+    document.getElementById('setTimeoutSeconds').value = d.timeout_seconds;
+    document.getElementById('setRetentionDays').value = d.retention_days;
+  }catch(e){
+    document.getElementById('setStatus').style.display='';
+    document.getElementById('setStatus').className='login-status err';
+    document.getElementById('setStatus').textContent='配置加载失败：'+esc(e.message);
+  }
+}
+async function saveSettings(){
+  const st = document.getElementById('setStatus');
+  st.style.display=''; st.className='login-status'; st.textContent='保存中...';
+  const rh = document.getElementById('setRefreshHours').value.split(',')
+    .map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n));
+  const body = {
+    checkin_hour: parseInt(document.getElementById('setCheckinHour').value,10),
+    refresh_hours: rh,
+    timeout_seconds: parseInt(document.getElementById('setTimeoutSeconds').value,10),
+    retention_days: parseInt(document.getElementById('setRetentionDays').value,10)
+  };
+  try{
+    const r = await fetch('/admin/api/settings', {
+      method:'PATCH', headers:{'Content-Type':'application/json', ...authHeader()},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if(!r.ok){ st.className='login-status err'; st.textContent='保存失败：'+apiErr(d); return; }
+    st.className='login-status ok';
+    st.textContent='已保存并生效';
+    loadSchedLogs();
+  }catch(e){ st.className='login-status err'; st.textContent='保存失败：'+esc(e.message); }
+}
+function schedBadge(r){
+  if(r==='success') return badge('成功','b-ok');
+  if(r==='partial') return badge('部分成功','b-warn');
+  if(r==='failed') return badge('失败','b-bad');
+  return badge('跳过','b-dim');
+}
+async function loadSchedLogs(){
+  const el = document.getElementById('schedLogTable');
+  try{
+    const r = await fetch('/admin/api/schedule/logs', {cache:'no-store', headers: authHeader()});
+    if(r.status === 401){ el.innerHTML=''; return; }
+    const d = await r.json();
+    const recs = d.records||[];
+    if(!recs.length){
+      el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无执行记录（签到/刷新到点后自动产生；记录文件路径见 config.json 的 schedule.log_file）。</div>';
+      return;
+    }
+    const rows = recs.map(x=>'<tr>'
+      + '<td class="mono">'+esc(x.started_at)+'</td>'
+      + '<td>'+esc(x.task==='checkin'?'签到':'token 刷新')+'</td>'
+      + '<td>'+schedBadge(x.result)+'</td>'
+      + '<td class="mono">'+(x.duration_ms/1000).toFixed(1)+'s</td>'
+      + '<td style="max-width:420px;word-break:break-all">'+esc(x.summary)+'</td>'
+      + '</tr>').join('');
+    el.innerHTML = '<table class="accts"><thead><tr>'
+      + '<th>时间</th><th>任务</th><th>结果</th><th>耗时</th><th>执行总结</th>'
+      + '</tr></thead><tbody>'+rows+'</tbody></table>';
+  }catch(e){
+    el.innerHTML = '<div style="color:var(--bad)">记录加载失败：'+esc(e.message)+'</div>';
+  }
+}
 
 /* ─── 账号管理 ─── */
 async function loadAccounts(){
