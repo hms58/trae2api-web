@@ -196,6 +196,45 @@ func TestStreamGuaranteesDone(t *testing.T) {
 	}
 }
 
+// 上游实测（2026-10）：带工具调用的轮次 done 也返回 finish_reason:"stop"，
+// 流式路径应纠正为 "tool_calls"，否则 agent 客户端不执行工具、任务中断。
+func TestStreamToolCallsStopOverriddenToToolCalls(t *testing.T) {
+	rec := httptest.NewRecorder()
+	raw := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"\",\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"北京\\\"}\"},\"index\":0}]}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Errorf("finish_reason should be tool_calls: %q", body)
+	}
+}
+
+func TestStreamNoToolCallsKeepsStop(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(soloSSEFixture)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"stop"`) {
+		t.Errorf("plain turn should keep stop: %q", rec.Body.String())
+	}
+}
+
+// 非流式聚合路径同样纠正：上游 stop + 工具调用 → tool_calls。
+func TestAggregateToolCallsStopOverriddenToToolCalls(t *testing.T) {
+	raw := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"\",\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"},\"index\":0}]}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason=%v", choice["finish_reason"])
+	}
+}
+
 func TestPrepareBodyToolsParametersStringified(t *testing.T) {
 	src := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}`
 	out := PrepareBody([]byte(src))

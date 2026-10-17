@@ -185,6 +185,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if upstreamErr != nil {
 		return nil, upstreamErr
 	}
+	// 上游实测（2026-10）：SOLO 在带工具调用的轮次也返回 finish_reason:"stop"，
+	// 按 OpenAI 语义纠正为 "tool_calls"，否则 agent 客户端不执行工具、任务中断。
+	if len(toolOrder) > 0 && finishReason == "stop" {
+		finishReason = "tool_calls"
+	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	}
@@ -327,6 +332,7 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	var pendingUsage map[string]any
 	sawDone := false
+	sawToolCalls := false
 	st := &sseState{}
 	writeChunk := func(delta map[string]any, finish string) error {
 		chunk := map[string]any{
@@ -399,6 +405,7 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 							}
 						}
 						delta["tool_calls"] = tc
+						sawToolCalls = true
 					}
 				}
 				if len(delta) > 0 {
@@ -409,7 +416,13 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			case "token_usage":
 				pendingUsage = ev.Usage
 			case "done":
-				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
+				// 上游实测：带工具调用的轮次 finish_reason 也返回 "stop"，
+				// 按 OpenAI 语义纠正为 "tool_calls"，否则 agent 客户端不执行工具。
+				finish := ev.FinishReason
+				if sawToolCalls && (finish == "" || finish == "stop") {
+					finish = "tool_calls"
+				}
+				if err := writeChunk(map[string]any{}, finish); err != nil {
 					return err
 				}
 				if err := writeDONE(); err != nil {
