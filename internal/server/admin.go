@@ -44,30 +44,28 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, s pool.Status) {
 			defer wg.Done()
-			a := h.cfg.Pool.AuthByUID(s.UID)
-			if a == nil {
-				out[i] = acct{UID: s.UID, Nickname: s.Nickname, Error: "no auth found"}
-				return
-			}
 			var ac acct
 			ac.UID = s.UID
 			ac.Nickname = s.Nickname
 			ac.Cooling = s.Cooling
 			ac.Disabled = s.Disabled
-			remain, limit, used, packs, err := h.cfg.Upstream.EntUsage(a)
-			if err != nil {
-				ac.Error = "ent_usage: " + err.Error()
+			// 额度走共享缓存（默认 10s TTL），与账号列表页共用同一份结果。
+			snap := h.lookupCredits(s.UID)
+			if snap.Err != nil {
+				ac.Error = "ent_usage: " + snap.Err.Error()
 			} else {
-				ac.Remain, ac.Limit, ac.Used, ac.Packs = remain, limit, used, packs
+				ac.Remain, ac.Limit, ac.Used, ac.Packs = snap.Remain, snap.Limit, snap.Used, snap.Packs
 			}
-			checkedIn, credits, enable, cerr := h.cfg.Upstream.CheckinStatus(a)
-			if cerr != nil {
+			// 签到状态走独立缓存（默认 5min TTL）：与额度是不同上游端点，
+			// 且一天只变一次，无需每次刷新都查。
+			ck := h.lookupCheckin(s.UID)
+			if ck.Err != nil {
 				if ac.Error != "" {
 					ac.Error += "; "
 				}
-				ac.Error += "checkin: " + cerr.Error()
+				ac.Error += "checkin: " + ck.Err.Error()
 			} else {
-				ac.CheckedIn, ac.CheckinCredits, ac.CheckinEnable = checkedIn, credits, enable
+				ac.CheckedIn, ac.CheckinCredits, ac.CheckinEnable = ck.CheckedIn, ck.Credits, ck.Enable
 			}
 			out[i] = ac
 		}(i, s)

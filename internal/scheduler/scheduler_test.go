@@ -47,6 +47,7 @@ type fakeUpstream struct {
 	claimCalls     atomic.Int32
 	refreshCalls   atomic.Int32
 	resourceRemain int64
+	checkedIn      bool // status 返回"已签到"（人工签到过）
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -54,7 +55,11 @@ func (f *fakeUpstream) server() *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
 			f.checkinCalls.Add(1)
-			w.Write([]byte(`{"checked_in":false,"credits":200,"enable":true}`))
+			checked := "false"
+			if f.checkedIn {
+				checked = "true"
+			}
+			w.Write([]byte(`{"checked_in":` + checked + `,"credits":200,"enable":true}`))
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			f.claimCalls.Add(1)
 			w.Write([]byte(`{"code":0,"message":"success"}`))

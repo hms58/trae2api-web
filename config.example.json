@@ -3,6 +3,7 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "default_model": "glm-5.2",
+  "chat_log_file": "./data/chatlog.jsonl",
   "cooldown": {
     "plan_credit": "12h",
     "soft_rate": "60s",
@@ -10,8 +11,12 @@
     "err_cooldown": "10m"
   },
   "schedule": {
+    "checkin_enabled": true,
     "checkin_hour": 9,
-    "refresh_hours": [3]
+    "refresh_hours": [3],
+    "jitter_minutes": 10,
+    "retention_days": 30,
+    "log_file": "./data/schedule-log.jsonl"
   },
   "upstream": {
     "timeout_seconds": 120
