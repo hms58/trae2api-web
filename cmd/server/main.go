@@ -93,6 +93,7 @@ func main() {
 		ErrThreshold: cfg.Cooldown.ErrThresh,
 		ErrCooldown:  cfg.ErrCooldownDur,
 		DefaultModel: cfg.DefaultModel,
+		ChatLogFile:  cfg.ChatLogFile,
 		Settings:     settings,
 		Scheduler:    sch,
 	})

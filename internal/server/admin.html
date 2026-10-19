@@ -82,6 +82,12 @@
                          padding:7px 10px; font-size:13px; width:100%; }
   .settings-grid label.chk { flex-direction:row; align-items:center; gap:8px; font-size:13px; color:var(--fg); }
   .settings-grid label.chk input { width:16px; height:16px; accent-color:var(--accent); }
+  /* 调用记录：统计卡片 + 筛选下拉 */
+  .statcard { background:var(--card); border:1px solid #232836; border-radius:12px; padding:14px 16px; }
+  .statcard .k { color:var(--dim); font-size:12px; }
+  .statcard .v { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; margin-top:4px; }
+  select.clsel { background:var(--card2); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
+                 padding:7px 10px; font-size:13px; min-width:130px; }
   /* modal */
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
   .modal-bg.show { display:flex; }
@@ -135,6 +141,7 @@
     <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
     <div class="tab" onclick="switchTab('sched',this)">定时任务</div>
     <div class="tab" onclick="switchTab('models',this)">模型列表</div>
+    <div class="tab" onclick="switchTab('chatlogs',this)">调用记录</div>
   </div>
 
   <!-- 账号管理 -->
@@ -195,6 +202,36 @@
     </div>
     <div id="modelTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
   </div>
+
+  <!-- 调用记录 -->
+  <div id="pane-chatlogs" class="pane">
+    <div id="chatStats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px">
+      <div style="color:var(--dim)"><span class="spin"></span> 加载中...</div>
+    </div>
+    <div class="login-bar">
+      <h2>调用记录（/v1/chat/completions 摘要，保留最近 30 天或 100MB）</h2>
+      <div class="imp-row">
+        <select id="clModel" class="clsel" onchange="clSearch()"><option value="">全部模型</option></select>
+        <select id="clStatus" class="clsel" onchange="clSearch()">
+          <option value="">全部状态</option>
+          <option value="ok">成功</option>
+          <option value="client_error">客户端错误</option>
+          <option value="upstream_error">上游错误</option>
+          <option value="no_account">无可用账号</option>
+        </select>
+        <select id="clUid" class="clsel" onchange="clSearch()"><option value="">全部账号</option></select>
+        <input id="clQuery" type="text" placeholder="搜消息预览/错误信息..." onkeydown="if(event.key==='Enter')clSearch()"
+               style="background:var(--card2);border:1px solid #2a2f3a;border-radius:6px;color:var(--fg);padding:7px 10px;font-size:13px;flex:1;min-width:140px">
+        <button class="btn primary" onclick="clSearch()">查询</button>
+      </div>
+    </div>
+    <div id="chatLogTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
+    <div id="chatPager" style="display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-top:12px;font-size:12px;color:var(--dim)">
+      <button class="btn sm" onclick="clGo(-1)">上一页</button>
+      <span id="chatPagerInfo">-</span>
+      <button class="btn sm" onclick="clGo(1)">下一页</button>
+    </div>
+  </div>
 </div>
 
 <!-- JSON 预览 modal -->
@@ -248,6 +285,7 @@ function refreshActive(){
   else if(activeTab==='credits') loadCredits();
   else if(activeTab==='sched') loadSched();
   else if(activeTab==='models') loadModels();
+  else if(activeTab==='chatlogs') loadChatlogs();
 }
 
 /* ─── 模型列表 ─── */
@@ -570,6 +608,83 @@ async function loadCredits(){
     renderCredits(await r.json());
   }catch(e){
     document.getElementById('grid').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+  }
+}
+
+/* ─── 调用记录 ─── */
+let clPage = 1;
+const CL_PAGE_SIZE = 50;
+function clSearch(){ clPage = 1; loadChatlogs(); }
+function clGo(delta){ clPage = Math.max(1, clPage + delta); loadChatlogs(); }
+function clBadge(s){
+  if(s==='ok') return badge('成功','b-ok');
+  if(s==='client_error') return badge('客户端错误','b-bad');
+  if(s==='no_account') return badge('无可用账号','b-bad');
+  return badge('上游错误','b-bad');
+}
+function fillSelect(id, list){
+  const el = document.getElementById(id);
+  const cur = el.value;
+  const opts = '<option value="">'+(id==='clModel'?'全部模型':'全部账号')+'</option>'
+    + (list||[]).map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
+  el.innerHTML = opts;
+  el.value = cur; // 保留用户当前选择
+  if(el.value !== cur) el.value = '';
+}
+function statCard(k, v){ return '<div class="statcard"><div class="k">'+esc(k)+'</div><div class="v">'+esc(v)+'</div></div>'; }
+async function loadChatlogs(){
+  const el = document.getElementById('chatLogTable');
+  const p = new URLSearchParams();
+  const m = document.getElementById('clModel').value; if(m) p.set('model', m);
+  const s = document.getElementById('clStatus').value; if(s) p.set('status', s);
+  const u = document.getElementById('clUid').value; if(u) p.set('uid', u);
+  const q = document.getElementById('clQuery').value.trim(); if(q) p.set('q', q);
+  p.set('page', clPage); p.set('page_size', CL_PAGE_SIZE);
+  try{
+    const [lr, sr] = await Promise.all([
+      fetch('/admin/api/chatlogs?'+p.toString(), {cache:'no-store', headers: authHeader()}),
+      fetch('/admin/api/chatlogs/stats', {cache:'no-store', headers: authHeader()})
+    ]);
+    if(lr.status === 401){
+      el.innerHTML = '<div style="color:var(--warn);padding:14px">请先在顶部输入 API Key 后刷新。</div>';
+      document.getElementById('chatStats').innerHTML = '';
+      return;
+    }
+    const d = await lr.json();
+    const st = await sr.json();
+    const calls = st.today_calls||0, ok = st.today_ok||0;
+    const rate = calls ? Math.round(ok*100/calls)+'%' : '-';
+    const tokens = (st.today_req_tokens||0) + (st.today_resp_tokens||0);
+    const mb = st.file_bytes > 0 ? (st.file_bytes/1048576).toFixed(1)+' MB' : '0 B';
+    document.getElementById('chatStats').innerHTML =
+      statCard('今日调用', calls) + statCard('成功率', rate)
+      + statCard('今日 tokens（估）', fmt(tokens)) + statCard('存储占用 / 上限', mb+' / 100 MB');
+    fillSelect('clModel', d.models);
+    fillSelect('clUid', d.uids);
+    const recs = d.records||[];
+    if(!recs.length){
+      el.innerHTML = '<div style="color:var(--dim);padding:14px">'+(d.total?'本页无记录':'暂无调用记录（发起 /v1/chat/completions 请求后自动产生）。')+'</div>';
+    } else {
+      const rows = recs.map(x=>{
+        const tok = (x.req_tokens || x.resp_tokens) ? fmt(x.req_tokens||0)+' / '+fmt(x.resp_tokens||0) : '-';
+        return '<tr>'
+          + '<td class="mono">'+esc((x.ts||'').replace('T',' ').slice(0,19))+'</td>'
+          + '<td class="mono">'+esc(x.model||'-')+(x.req_model && x.req_model!==x.model ? '<div class="mono" style="font-size:10px">req: '+esc(x.req_model)+'</div>':'')+'</td>'
+          + '<td class="mono">'+esc(x.uid||'-')+(x.attempts>1?' '+badge('换号×'+x.attempts,'b-warn'):'')+'</td>'
+          + '<td>'+clBadge(x.status)+(x.err?'<div class="mono" style="color:var(--bad);font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(x.err)+'">'+esc(x.err)+'</div>':'')+'</td>'
+          + '<td class="mono">'+(x.stream?'流式':'-')+'</td>'
+          + '<td class="mono">'+(x.latency_ms!=null ? (x.latency_ms/1000).toFixed(1)+'s' : '-')+'</td>'
+          + '<td class="mono">'+tok+'</td>'
+          + '<td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(x.preview||'')+'">'+esc(x.preview||'-')+'</td>'
+          + '</tr>';
+      }).join('');
+      el.innerHTML = '<table class="accts"><thead><tr>'
+        + '<th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>流式</th><th>耗时</th><th>tokens(req/resp)</th><th>消息预览</th>'
+        + '</tr></thead><tbody>'+rows+'</tbody></table>';
+    }
+    document.getElementById('chatPagerInfo').textContent = '第 '+d.page+' 页 · 共 '+fmt(d.total)+' 条';
+  }catch(e){
+    el.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
   }
 }
 

@@ -21,6 +21,7 @@ type Config struct {
 	AuthDir       string `json:"auth_dir"`       // "./auths"
 	StateFile     string `json:"state_file"`     // "./data/state.json"
 	DefaultModel  string `json:"default_model"`  // "glm-5.2"
+	ChatLogFile   string `json:"chat_log_file"`  // 调用记录 JSONL，默认 ./data/chatlog.jsonl（空 = 不记录）
 
 	Cooldown struct {
 		PlanCredit  string `json:"plan_credit"`   // "12h"
@@ -59,6 +60,7 @@ func Default() *Config {
 		AuthDir:      "./auths",
 		StateFile:    "./data/state.json",
 		DefaultModel: "glm-5.2",
+		ChatLogFile:  "./data/chatlog.jsonl",
 	}
 	c.Cooldown.PlanCredit = "12h"
 	c.Cooldown.SoftRate = "60s"
@@ -113,6 +115,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("TW2A_DEFAULT_MODEL"); v != "" {
 		c.DefaultModel = v
+	}
+	if v := os.Getenv("TW2A_CHAT_LOG_FILE"); v != "" {
+		c.ChatLogFile = v
 	}
 	if v := os.Getenv("TW2A_PLAN_CREDIT"); v != "" {
 		c.Cooldown.PlanCredit = v
