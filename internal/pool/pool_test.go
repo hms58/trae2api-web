@@ -207,6 +207,29 @@ func TestSyncToDirRemovesMissing(t *testing.T) {
 	}
 }
 
+// Add/SyncToDir 后立即落盘：账号加载（未发生任何状态变更）也生成 state.json。
+func TestAddAndSyncPersistStateFile(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "data", "state.json")
+
+	// Add 落盘（父目录不存在时自动创建）
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	if _, err := os.Stat(fp); err != nil {
+		t.Fatalf("state file should exist after Add: %v", err)
+	}
+	p2 := New(fp)
+	if _, ok := p2.Status("u1"); !ok {
+		t.Error("reload should contain u1")
+	}
+
+	// SyncToDir 落盘：新增账号写入
+	p.SyncToDir([]*auth.Auth{{UID: "u1"}, {UID: "u2"}})
+	p3 := New(fp)
+	if _, ok := p3.Status("u2"); !ok {
+		t.Error("reload should contain u2 after SyncToDir")
+	}
+}
+
 func TestRemove(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})

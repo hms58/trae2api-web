@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"trae2api-web/internal/auth"
 )
@@ -27,6 +28,8 @@ type accountSummary struct {
 	Cooling      bool   `json:"cooling"`
 	Reason       string `json:"reason,omitempty"`
 	Credits      int64  `json:"credits"`
+	// CreditsError 非空 = 实时额度查询失败，credits 为池内缓存值（可能过期）。
+	CreditsError string `json:"credits_error,omitempty"`
 	ErrCount     int    `json:"err_count,omitempty"`
 	// Token 有效期（Unix 秒）与是否临近过期
 	ExpiresAt    int64  `json:"expires_at,omitempty"`
@@ -37,19 +40,21 @@ type accountSummary struct {
 }
 
 // adminAccounts GET /admin/api/accounts：列表（无鉴权，只读）。
+// 积分实时向上游查询（并发），失败时回退池内缓存并标记 credits_error。
 func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	statuses := h.cfg.Pool.List()
-	out := make([]accountSummary, 0, len(statuses))
-	for _, s := range statuses {
+	out := make([]accountSummary, len(statuses))
+	var wg sync.WaitGroup
+	for i, s := range statuses {
 		sum := accountSummary{
-			UID:       s.UID,
-			Nickname:  s.Nickname,
-			Enabled:   s.Enabled,
-			Disabled:  s.Disabled,
-			Cooling:   s.Cooling,
-			Reason:    s.Reason,
-			Credits:   s.Credits,
-			ErrCount:  s.ErrCount,
+			UID:      s.UID,
+			Nickname: s.Nickname,
+			Enabled:  s.Enabled,
+			Disabled: s.Disabled,
+			Cooling:  s.Cooling,
+			Reason:   s.Reason,
+			Credits:  s.Credits,
+			ErrCount: s.ErrCount,
 		}
 		if a := h.cfg.Pool.AuthByUID(s.UID); a != nil {
 			sum.HasAuth = true
@@ -60,8 +65,24 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 			sum.MachineID = prefix(a.MachineID, 8)
 			sum.DeviceID = prefix(a.DeviceID, 8)
 		}
-		out = append(out, sum)
+		out[i] = sum
+		// 额度：走共享缓存（默认 10s TTL），避免频繁刷新打上游被风控。
+		// 池缓存只在签到任务里更新，直接展示会长期为 0。
+		if h.cfg.Upstream == nil || !sum.HasAuth {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, uid string) {
+			defer wg.Done()
+			snap := h.lookupCredits(uid)
+			if snap.Err != nil {
+				out[i].CreditsError = snap.Err.Error()
+				return
+			}
+			out[i].Credits = snap.Remain
+		}(i, s.UID)
 	}
+	wg.Wait()
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }
 
@@ -145,6 +166,9 @@ func (h *Handler) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 		action = "updated"
 	}
 	h.cfg.Pool.Add(a)
+	// 新凭证 → 额度与签到状态均需重查
+	h.invalidateCredits(a.UID)
+	h.invalidateCheckin(a.UID)
 
 	writeJSON(w, http.StatusOK, importResult{
 		UID: a.UID, Nickname: a.Nickname, Action: action, NeedsCheck: true,
@@ -260,13 +284,38 @@ func (h *Handler) adminPatchAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Enabled != nil {
-		reason := "user enabled"
-		if !*req.Enabled {
-			reason = "user disabled"
-		}
-		if !h.cfg.Pool.SetEnabled(uid, *req.Enabled, reason) {
-			writeOpenAIError(w, http.StatusNotFound, "not_found", "account vanished")
-			return
+		if *req.Enabled {
+			// 硬禁用账号重新启用 → 先用 refreshToken 探测凭证有效性，成功才复活；
+			// 失败保持禁用并返回原因（页面可见），避免"开了开关但永远不被调度"的自洽漏洞。
+			if st.Disabled {
+				a := h.cfg.Pool.AuthByUID(uid)
+				if a == nil {
+					writeOpenAIError(w, http.StatusNotFound, "not_found", "no auth for uid")
+					return
+				}
+				if err := h.cfg.Upstream.RefreshToken(a); err != nil {
+					writeOpenAIError(w, http.StatusBadGateway, "revive_failed",
+						"refresh failed（凭证仍无效，账号保持禁用）: "+err.Error())
+					return
+				}
+				if a.FilePath == "" {
+					a.FilePath = auth.FilePathFor(h.cfg.AuthDir, uid)
+				}
+				if err := a.SaveAtomic(); err != nil {
+					writeOpenAIError(w, http.StatusInternalServerError, "save_failed", err.Error())
+					return
+				}
+				h.cfg.Pool.Revive(uid)
+			}
+			if !h.cfg.Pool.SetEnabled(uid, true, "user enabled") {
+				writeOpenAIError(w, http.StatusNotFound, "not_found", "account vanished")
+				return
+			}
+		} else {
+			if !h.cfg.Pool.SetEnabled(uid, false, "user disabled") {
+				writeOpenAIError(w, http.StatusNotFound, "not_found", "account vanished")
+				return
+			}
 		}
 	}
 	_ = st // nickname 更新需要改 auth 文件
@@ -287,6 +336,7 @@ func (h *Handler) adminPatchAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminRefreshAccount POST /admin/api/accounts/{uid}/refresh：手动 ExchangeToken + 落盘。
+// 账号处于硬禁用（session dead）时刷新成功 = 凭证已验证有效 → 自动复活。
 func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := h.cfg.Pool.AuthByUID(uid)
@@ -294,6 +344,7 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "no auth for uid")
 		return
 	}
+	wasDisabled, _ := h.cfg.Pool.Status(uid)
 	if err := h.cfg.Upstream.RefreshToken(a); err != nil {
 		// session 失效 → 硬禁用（与 chat 路径一致）
 		if isSessionDeadErr(err) {
@@ -309,11 +360,17 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "save_failed", err.Error())
 		return
 	}
+	if wasDisabled.Disabled {
+		h.cfg.Pool.Revive(uid)
+	}
+	// 凭证变化 → 额度与签到状态均需重查
+	h.invalidateCredits(uid)
+	h.invalidateCheckin(uid)
 	st, _ := h.cfg.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"uid":       uid,
+		"uid":        uid,
 		"expires_at": a.ExpiresAt,
-		"status":    st,
+		"status":     st,
 	})
 }
 

@@ -255,6 +255,9 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 		if r.Header.Get("X-User-Region") != "CN" {
 			return nil, errors.New("missing X-User-Region")
 		}
+		if r.URL.Path == EpCheckinClaim {
+			return jsonResp(200, `{"code":0,"credits":200,"message":"success"}`), nil
+		}
 		return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
 	})
 	checkedIn, credits, enable, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
@@ -266,5 +269,110 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 	}
 	if path != EpCheckinStatus {
 		t.Errorf("path=%s", path)
+	}
+	gained, err := c.CheckinClaim(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if gained != 200 {
+		t.Errorf("gained=%d want 200", gained)
+	}
+	if path != EpCheckinClaim {
+		t.Errorf("claim path=%s", path)
+	}
+}
+
+// 领取接口的业务码必须被解析：9074（设备未登记/风控）以 HTTP 200 + code 返回，
+// 旧实现丢弃响应体直接当成功，导致「显示成功其实没领到」。
+func TestCheckinClaimBusinessError(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`), nil
+	})
+	gained, err := c.CheckinClaim(&auth.Auth{AccessToken: "at"})
+	if err == nil {
+		t.Fatalf("code=9074 must fail, gained=%d", gained)
+	}
+	var ce *CheckinError
+	if !errors.As(err, &ce) || ce.Code != 9074 {
+		t.Fatalf("err=%v want *CheckinError code 9074", err)
+	}
+	if !IsDeviceRejected(err) {
+		t.Error("9074 should be classified as device rejected")
+	}
+	if IsAlreadyCheckedIn(err) {
+		t.Error("9074 is not already-checked-in")
+	}
+}
+
+// 9095（该设备当日已被其它账号占用）同样必须报错。
+func TestCheckinClaimDeviceOccupied(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":9095,"message":"设备今日已被占用"}`), nil
+	})
+	if _, err := c.CheckinClaim(&auth.Auth{AccessToken: "at"}); !IsDeviceRejected(err) {
+		t.Errorf("err=%v want device rejected", err)
+	}
+}
+
+// 领取奖励兼容 data.points / data.credits 两种下发位置。
+func TestCheckinClaimCreditsInData(t *testing.T) {
+	for _, body := range []string{
+		`{"code":0,"data":{"points":150}}`,
+		`{"code":0,"data":{"credits":150}}`,
+	} {
+		c := testClient(func(r *http.Request) (*http.Response, error) {
+			return jsonResp(200, body), nil
+		})
+		gained, err := c.CheckinClaim(&auth.Auth{AccessToken: "at"})
+		if err != nil || gained != 150 {
+			t.Errorf("body=%s gained=%d err=%v", body, gained, err)
+		}
+	}
+}
+
+// data 不是对象时不能把成功响应解析成失败。
+func TestCheckinClaimNonObjectData(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"credits":100,"data":"ok"}`), nil
+	})
+	gained, err := c.CheckinClaim(&auth.Auth{AccessToken: "at"})
+	if err != nil || gained != 100 {
+		t.Errorf("gained=%d err=%v", gained, err)
+	}
+}
+
+// 状态接口 code != 0（如 1001 令牌失效）必须报错，
+// 否则零值会被读成「未签到 + 未开启」，调用方当成无事可做。
+func TestCheckinStatusBusinessError(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":1001,"message":"not able to authenticate you"}`), nil
+	})
+	_, _, _, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
+	var ce *CheckinError
+	if !errors.As(err, &ce) || ce.Code != 1001 {
+		t.Fatalf("err=%v want *CheckinError code 1001", err)
+	}
+}
+
+// enable 缺省视为开启：上游只在活动关闭时下发 false。
+func TestCheckinStatusEnableDefaultsTrue(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"checked_in":false,"credits":100}`), nil
+	})
+	checkedIn, _, enable, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
+	if err != nil || checkedIn || !enable {
+		t.Errorf("checked=%v enable=%v err=%v", checkedIn, enable, err)
+	}
+}
+
+func TestCheckinErrorAlready(t *testing.T) {
+	if !IsAlreadyCheckedIn(&CheckinError{Code: 1, Message: "今日已签到"}) {
+		t.Error("中文已签到应识别为幂等")
+	}
+	if !IsAlreadyCheckedIn(&CheckinError{Code: 1, Message: "Already checked in today"}) {
+		t.Error("英文 already checked 应识别为幂等")
+	}
+	if IsAlreadyCheckedIn(errors.New("already checked")) {
+		t.Error("非业务错误不应被当作已签到")
 	}
 }

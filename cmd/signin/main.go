@@ -78,7 +78,7 @@ func main() {
 		checkedIn, _, enable, serr := up.CheckinStatus(a)
 		switch {
 		case serr != nil:
-			if isAlready(serr.Error()) {
+			if upstream.IsAlreadyCheckedIn(serr) || isAlready(serr.Error()) {
 				r.status = "ALREADY"
 				r.detail = short(serr.Error())
 				alreadyN++
@@ -92,17 +92,23 @@ func main() {
 			r.detail = "already checked in"
 			alreadyN++
 		case !enable:
-			r.status = "FAIL"
-			r.detail = "checkin disabled"
-			failN++
+			r.status = "SKIP"
+			r.detail = "checkin disabled by upstream"
 		default:
-			if err := up.CheckinClaim(a); err != nil {
-				r.status = "FAIL"
-				r.detail = short(err.Error())
-				failN++
-			} else {
+			gained, cerr := up.CheckinClaim(a)
+			switch {
+			case cerr == nil:
 				r.status = "OK"
+				r.detail = fmt.Sprintf("+%d credits", gained)
 				okN++
+			case upstream.IsAlreadyCheckedIn(cerr):
+				r.status = "ALREADY"
+				r.detail = short(cerr.Error())
+				alreadyN++
+			default:
+				r.status = "FAIL"
+				r.detail = short(cerr.Error())
+				failN++
 			}
 		}
 		// 查积分

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"trae2api-web/internal/auth"
 	"trae2api-web/internal/pool"
@@ -33,6 +34,25 @@ func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body 
 			return &http.Response{
 				StatusCode: status,
 				Header:     http.Header{"Content-Type": []string{ct}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+}
+
+// newPathUpstream 按请求路径分流的 fake 上游（用于区分不同上游端点的用例）。
+func newPathUpstream(t *testing.T, behavior func(path string) (status int, body string)) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			status, body := behavior(r.URL.Path)
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
 				Body:       io.NopCloser(strings.NewReader(body)),
 			}, nil
 		})},
@@ -240,6 +260,138 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 	if !found {
 		t.Error("glm-5.2 missing")
+	}
+}
+
+// provider 前缀（"前缀:模型名"）应剥离，仅用冒号后的 config_name 转发。
+func TestMapModelStripsProviderPrefix(t *testing.T) {
+	h := NewHandler(Config{DefaultModel: "glm-5.2", Pool: pool.New("")})
+	cases := []struct{ in, want string }{
+		{"trae-cn-local:glm-5.2", "glm-5.2"},
+		{"glm-5.2", "glm-5.2"},
+		{"any-vendor:DeepSeek-V4-Pro", "DeepSeek-V4-Pro"},
+		{"provider:glm-5.2__dev", "glm-5.2"},
+		{"glm-5.2__dev", "glm-5.2"},
+		{"auto", "glm-5.2"},
+		{"", "glm-5.2"},
+	}
+	for _, c := range cases {
+		got, err := h.mapModel(c.in)
+		if err != nil {
+			t.Errorf("mapModel(%q) err=%v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("mapModel(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+	// 前缀后为无效模型仍拒绝（不静默回退默认）
+	if _, err := h.mapModel("provider:no-such-model"); err == nil {
+		t.Error("unknown tail should still be rejected")
+	}
+	// 仅前缀、冒号后为空 → 视为畸形输入报错
+	if _, err := h.mapModel("provider:"); err == nil {
+		t.Error("trailing colon should be rejected")
+	}
+}
+
+// 动态模型表必须带非 0 的 context_length（曾因 int64/int 接口比较陷阱全返回 0）。
+func TestModelListContextLengthNonZero(t *testing.T) {
+	infos := []upstream.ModelInfo{{ID: "a", ContextWindow: 0}, {ID: "b", ContextWindow: 200000}}
+	// 直接验证包装逻辑：动态路径 + 静态路径都不应出现 0
+	for _, m := range wrapModelEntries(infos) {
+		if m["context_length"] == 0 || m["context_length"] == int64(0) {
+			t.Errorf("model %v has zero context_length", m["id"])
+		}
+	}
+	for _, m := range staticModels {
+		if m["context_length"] == 0 {
+			t.Errorf("static model %v has zero context_length", m["id"])
+		}
+	}
+}
+
+// resetModelsCache 清空包级动态模型缓存（成功缓存 1h / 负缓存 5min 会串测试）。
+func resetModelsCache() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+}
+
+// 管理面板模型列表端点：静态回退时返回静态表 + source=static。
+func TestAdminModelsEndpoint(t *testing.T) {
+	resetModelsCache()
+	t.Cleanup(resetModelsCache)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 500, `boom`, false // 动态拉取失败 → 回退静态表
+	})
+	h := NewHandler(Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream:     up,
+		DefaultModel: "glm-5.2",
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/admin/api/models", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var d struct {
+		Source string           `json:"source"`
+		Count  int              `json:"count"`
+		Models []map[string]any `json:"models"`
+		Default string          `json:"default"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Source != "static" {
+		t.Errorf("source=%s want static", d.Source)
+	}
+	if d.Count != len(staticModels) || len(d.Models) != d.Count {
+		t.Errorf("count=%d models=%d want %d", d.Count, len(d.Models), len(staticModels))
+	}
+	if d.Default != "glm-5.2" {
+		t.Errorf("default=%s", d.Default)
+	}
+	for _, m := range d.Models {
+		if m["context_length"] == nil || m["context_length"] == 0 || m["context_length"] == int64(0) {
+			t.Errorf("model %v missing context_length", m["id"])
+		}
+	}
+}
+
+// 动态拉取成功 → source=dynamic 且带缓存时间。
+func TestAdminModelsEndpointDynamic(t *testing.T) {
+	resetModelsCache()
+	t.Cleanup(resetModelsCache)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"config_info_list":[{"config_name":"glm-5.2","display_config":{"display_name":"GLM 5.2"}},{"config_name":"kimi-k3"}]}`, false
+	})
+	h := NewHandler(Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream:     up,
+		DefaultModel: "glm-5.2",
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/admin/api/models", nil))
+	var d struct {
+		Source    string `json:"source"`
+		Count     int    `json:"count"`
+		FetchedAt string `json:"fetched_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Source != "dynamic" {
+		t.Errorf("source=%s want dynamic", d.Source)
+	}
+	if d.Count != 2 {
+		t.Errorf("count=%d want 2", d.Count)
+	}
+	if d.FetchedAt == "" {
+		t.Error("fetched_at should be set for dynamic source")
 	}
 }
 

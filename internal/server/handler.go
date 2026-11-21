@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"trae2api-web/internal/pool"
+	"trae2api-web/internal/scheduler"
 	"trae2api-web/internal/upstream"
 )
 
@@ -29,6 +30,18 @@ type Config struct {
 	ErrCooldown  time.Duration // 错误冷却，默认 10m
 	RefreshSkew  time.Duration // token 预刷新窗口，默认 24h
 	DefaultModel string        // 默认 glm-5.2
+
+	// CreditsCacheTTL 额度查询缓存时长（账号列表 + 额度监控共用），默认 10s。
+	CreditsCacheTTL time.Duration
+	// CheckinCacheTTL 签到状态缓存时长（额度监控页），默认 5min。
+	CheckinCacheTTL time.Duration
+
+	// Settings 页面可编辑配置存储（nil = 禁用配置端点）。
+	Settings *SettingsStore
+	// Scheduler 定时任务（nil = 无执行记录端点）。
+	Scheduler *scheduler.Scheduler
+	// ChatLogFile 调用记录 JSONL 路径（空 = 不记录）。
+	ChatLogFile string
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -43,6 +56,13 @@ type Handler struct {
 	// 回调 /authorize 捕获后标记成功；面板轮询 result 取结果。
 	loginMu sync.Mutex
 	logins   map[string]*pendingLogin
+
+	// credits/checkin 面板数据缓存（账号列表 + 额度监控共用，避免频繁打上游）。
+	credits *ttlCache[creditsSnapshot]
+	checkin *ttlCache[checkinSnapshot]
+
+	// chatlog /v1/chat/completions 调用记录（nil = 未启用）。
+	chatlog *ChatLog
 }
 
 // NewHandler 构建 handler。
@@ -68,7 +88,16 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = upstream.DefaultConfigName
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), logins: map[string]*pendingLogin{}}
+	h := &Handler{
+		cfg:     cfg,
+		mux:     http.NewServeMux(),
+		logins:  map[string]*pendingLogin{},
+		credits: newTTLCache[creditsSnapshot](cfg.CreditsCacheTTL, defaultCreditsCacheTTL),
+		checkin: newTTLCache[checkinSnapshot](cfg.CheckinCacheTTL, defaultCheckinCacheTTL),
+	}
+	if cfg.ChatLogFile != "" {
+		h.chatlog = NewChatLog(cfg.ChatLogFile)
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -92,6 +121,14 @@ func NewHandler(cfg Config) *Handler {
 	// TRAE 回调落点（/authorize）：无需 Bearer（TRAE 浏览器 302 不带 key），
 	// 仅捕获 query 写 pending 队列，不直接落盘 token。
 	h.mux.HandleFunc("GET /authorize", h.authorizeCallback)
+	// 运行配置（schedule/upstream 段）+ 定时任务执行记录。
+	h.mux.HandleFunc("GET /admin/api/settings", h.withAdminAuth(h.adminGetSettings))
+	h.mux.HandleFunc("PATCH /admin/api/settings", h.withAdminAuth(h.adminUpdateSettings))
+	h.mux.HandleFunc("GET /admin/api/schedule/logs", h.withAdminAuth(h.adminScheduleLogs))
+	h.mux.HandleFunc("GET /admin/api/models", h.withAdminAuth(h.adminModels))
+	// 调用记录（/v1/chat/completions 摘要日志，30 天/100MB 裁剪）
+	h.mux.HandleFunc("GET /admin/api/chatlogs", h.withAdminAuth(h.adminChatLogs))
+	h.mux.HandleFunc("GET /admin/api/chatlogs/stats", h.withAdminAuth(h.adminChatLogStats))
 	return h
 }
 
@@ -168,6 +205,16 @@ func (h *Handler) mapModel(model string) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "auto" {
 		return h.cfg.DefaultModel, nil
+	}
+	// 去掉 provider 前缀："trae-cn-local:deepseek-v4.1-flash" → "deepseek-v4.1-flash"。
+	// 多配置场景（同名模型不同 url）用前缀区分，上游只认冒号后的 config_name。
+	// 取最后一个冒号，兼容模型名本身含冒号的情况；冒号后为空视为畸形输入。
+	if i := strings.LastIndex(model, ":"); i >= 0 {
+		tail := strings.TrimSpace(model[i+1:])
+		if tail == "" {
+			return "", fmt.Errorf("unknown model %q", model)
+		}
+		model = tail
 	}
 	// 去掉内部名后缀（__dev / __max 等）
 	base := model
@@ -263,26 +310,64 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// adminModels GET /admin/api/models：全局模型列表（含来源、缓存时间、默认模型），
+// 供管理面板展示。模型表由上游 X-Ide-Version 决定，与账号无关。
+func (h *Handler) adminModels(w http.ResponseWriter, r *http.Request) {
+	dynamic := h.fetchDynamicModels()
+	entries := staticModels
+	source := "static"
+	if len(dynamic) > 0 {
+		entries = wrapModelEntries(dynamic)
+		source = "dynamic"
+	}
+	dynamicModelsCache.RLock()
+	fetchedAt := dynamicModelsCache.fetched
+	lastFail := dynamicModelsCache.lastFail
+	dynamicModelsCache.RUnlock()
+
+	resp := map[string]any{
+		"source":     source,
+		"count":      len(entries),
+		"models":     entries,
+		"default":    h.cfg.DefaultModel,
+		"fetched_at": fetchedAt.Format("2006-01-02 15:04:05"),
+		"ttl":        dynamicModelsTTL.String(),
+	}
+	if !lastFail.IsZero() {
+		resp["last_fail_at"] = lastFail.Format("2006-01-02 15:04:05")
+		resp["fail_cooldown"] = modelsFetchFailCooldown.String()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
-		for _, mi := range infos {
-			entry := map[string]any{
-				"id":             mi.ID,
-				"object":         "model",
-				"created":        1753600000,
-				"owned_by":       "trae-solo",
-				"context_length": mi.ContextWindow,
-			}
-			if entry["context_length"] == 0 {
-				entry["context_length"] = 131072
-			}
-			out = append(out, entry)
-		}
-		return out
+		return wrapModelEntries(infos)
 	}
 	return staticModels
+}
+
+// wrapModelEntries 把上游 ModelInfo 包装成 OpenAI 模型表条目。
+// 上游 get_detail_param 不返回上下文长度，ContextWindow 恒为 0 → 用静态兜底 131072。
+// 注意：不能在 map[string]any 上做 `== 0` 判断——int64 与 int 字面量类型不同，
+// 接口比较恒为 false，兜底会静默失效（曾导致 /v1/models 全返回 0）。
+func wrapModelEntries(infos []upstream.ModelInfo) []map[string]any {
+	out := make([]map[string]any, 0, len(infos))
+	for _, mi := range infos {
+		ctxLen := mi.ContextWindow
+		if ctxLen <= 0 {
+			ctxLen = 131072
+		}
+		out = append(out, map[string]any{
+			"id":             mi.ID,
+			"object":         "model",
+			"created":        1753600000,
+			"owned_by":       "trae-solo",
+			"context_length": ctxLen,
+		})
+	}
+	return out
 }
 
 // fetchDynamicModels 从池中任一健康账号拉模型列表（get_detail_param），缓存 1h。
@@ -337,12 +422,39 @@ func setModelInBody(body []byte, configName string) []byte {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	var entry ChatLogEntry
+	var respBytes int64
+	var entryDone bool
+	// markDone 记录最终结果状态（先到先得：成功/最终失败只认第一个出口）。
+	markDone := func(status, errMsg string) {
+		if !entryDone {
+			entryDone = true
+			entry.Status, entry.Err = status, errMsg
+		}
+	}
+	defer func() {
+		if h.chatlog == nil {
+			return
+		}
+		if !entryDone {
+			markDone("upstream_error", "handler exited unexpectedly")
+		}
+		entry.LatencyMS = time.Since(start).Milliseconds()
+		// 流式路径没有结构化 usage，用响应字节粗估（SSE JSON 包络含开销，仅参考）。
+		if entry.RespTokens == 0 && respBytes > 0 {
+			entry.RespTokens = respBytes / 4
+		}
+		h.chatlog.Record(entry)
+	}()
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
+		markDone("client_error", "read body: "+err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
 	if len(body) > maxBodyBytes {
+		markDone("client_error", "request body exceeds 8MB limit")
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
 		return
 	}
@@ -354,14 +466,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	configName, err := h.mapModel(peek.Model)
 	if err != nil {
+		markDone("client_error", err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	body = setModelInBody(body, configName)
 
+	// 摘要记录：请求侧字段在此一次性填好，响应侧在成功出口补。
+	entry = ChatLogEntry{
+		Ts:        start.Format(time.RFC3339),
+		Model:     configName,
+		ReqModel:  peek.Model,
+		Stream:    peek.Stream,
+		ReqTokens: estimateTokens(string(body)),
+		Preview:   firstUserPreview(body),
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+		entry.Attempts++
 		acct := h.cfg.Pool.PickExcluding(tried)
 		if acct == nil {
 			break
@@ -418,11 +542,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if peek.Stream {
 			h.cfg.Pool.NoteSuccess(acct.UID)
+			entry.UID = acct.UID
+			cw := &countWriter{ResponseWriter: w}
 			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
-			_ = upstream.StreamWithError(w, rc, func(se *upstream.SOLOStreamError) {
+			var streamErrMsg string
+			_ = upstream.StreamWithError(cw, rc, func(se *upstream.SOLOStreamError) {
 				h.handleStreamError(acct.UID, se)
+				streamErrMsg = se.Msg
 			})
+			respBytes = cw.n
 			rc.Close()
+			if streamErrMsg != "" {
+				markDone("upstream_error", streamErrMsg)
+			} else {
+				markDone("ok", "")
+			}
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
@@ -440,10 +574,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			markDone("upstream_error", err.Error())
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		entry.UID = acct.UID
+		// 优先用上游结构化 usage（token_usage 事件），缺失时按聚合响应字节粗估。
+		if usage, ok := resp["usage"].(map[string]any); ok {
+			entry.ReqTokens = int64(getNum(usage, "prompt_tokens"))
+			entry.RespTokens = int64(getNum(usage, "completion_tokens"))
+		} else if raw, merr := json.Marshal(resp); merr == nil {
+			respBytes = int64(len(raw))
+		}
+		markDone("ok", "")
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -451,7 +595,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
+	markDone("no_account", msg)
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+}
+
+// getNum 从 usage map 取 float64 数值字段（JSON 解码后数字均为 float64）。
+func getNum(m map[string]any, key string) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	return 0
 }
 
 // handleStreamError 流式响应中的上游业务错误 → pool 冷却状态机。
