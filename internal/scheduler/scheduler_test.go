@@ -47,7 +47,11 @@ type fakeUpstream struct {
 	claimCalls     atomic.Int32
 	refreshCalls   atomic.Int32
 	resourceRemain int64
-	checkedIn      bool // status 返回"已签到"（人工签到过）
+	checkedIn      bool   // status 返回"已签到"（人工签到过）
+	claimBody      string // claim 响应体，空 = {"code":0,"message":"success"}
+	statusBody     string // status 响应体，空 = 按 checkedIn 生成
+	// checkedInAfterClaim 领取请求过后 status 改报已签到（模拟「报错但实际已入账」）
+	checkedInAfterClaim bool
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -55,13 +59,21 @@ func (f *fakeUpstream) server() *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
 			f.checkinCalls.Add(1)
+			if f.statusBody != "" {
+				w.Write([]byte(f.statusBody))
+				return
+			}
 			checked := "false"
-			if f.checkedIn {
+			if f.checkedIn || (f.checkedInAfterClaim && f.claimCalls.Load() > 0) {
 				checked = "true"
 			}
 			w.Write([]byte(`{"checked_in":` + checked + `,"credits":200,"enable":true}`))
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			f.claimCalls.Add(1)
+			if f.claimBody != "" {
+				w.Write([]byte(f.claimBody))
+				return
+			}
 			w.Write([]byte(`{"code":0,"message":"success"}`))
 		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
 			w.Write([]byte(`{"is_credits_billing":true,"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":` +
@@ -137,6 +149,86 @@ func TestRunCheckinSkipsDisabled(t *testing.T) {
 	s.RunCheckinNow()
 	if f.checkinCalls.Load() != 0 {
 		t.Errorf("disabled account should be skipped, calls=%d", f.checkinCalls.Load())
+	}
+}
+
+// 领取被上游以业务码拒绝（HTTP 200 + code=9074）时必须记失败：
+// 旧实现丢弃响应体，把 9074 当成功写进执行记录，造成「显示成功其实没领到」。
+func TestRunCheckinClaimBusinessErrorCountsFailed(t *testing.T) {
+	f := &fakeUpstream{
+		resourceRemain: 500,
+		claimBody:      `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`,
+	}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+	recs := s.Records()
+	if len(recs) != 1 {
+		t.Fatalf("records=%d want 1", len(recs))
+	}
+	if recs[0].Result != "failed" {
+		t.Errorf("result=%q want failed", recs[0].Result)
+	}
+	if !strings.Contains(recs[0].Summary, "9074") {
+		t.Errorf("summary should carry upstream code: %q", recs[0].Summary)
+	}
+}
+
+// 领取报错但复查已签到：按已签到计，不误报失败（如超时后上游其实已入账）。
+func TestRunCheckinClaimErrorVerifiedCheckedIn(t *testing.T) {
+	f := &fakeUpstream{
+		resourceRemain:      500,
+		claimBody:           `{"code":1,"message":"internal busy"}`,
+		checkedInAfterClaim: true,
+	}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+	if f.checkinCalls.Load() != 2 {
+		t.Errorf("status calls=%d want 2 (initial + verify after claim error)", f.checkinCalls.Load())
+	}
+	recs := s.Records()
+	if len(recs) != 1 {
+		t.Fatalf("records=%d want 1", len(recs))
+	}
+	if recs[0].Result != "success" {
+		t.Errorf("result=%q summary=%q want success (verified checked in)", recs[0].Result, recs[0].Summary)
+	}
+}
+
+// 上游关闭签到（enable=false）不能计入成功：没有领取动作就是没有领取。
+func TestRunCheckinUpstreamDisabledCountsSkipped(t *testing.T) {
+	f := &fakeUpstream{
+		resourceRemain: 500,
+		statusBody:     `{"checked_in":false,"credits":0,"enable":false}`,
+	}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+	if f.claimCalls.Load() != 0 {
+		t.Errorf("claim should not be sent when enable=false, calls=%d", f.claimCalls.Load())
+	}
+	recs := s.Records()
+	if len(recs) != 1 {
+		t.Fatalf("records=%d want 1", len(recs))
+	}
+	if recs[0].Result != "skipped" {
+		t.Errorf("result=%q want skipped", recs[0].Result)
 	}
 }
 

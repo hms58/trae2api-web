@@ -244,26 +244,43 @@ func (s *Scheduler) doCheckin() (summary, result string) {
 			continue
 		}
 		acctFailed := false
-		counted := false // 该账号是否已计入 ok/already（防 ent-usage 失败时双重计 failed 或重复计成功）
 		// 签到（status → 未签到则 claim）；失败不阻断解冻
 		checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
-		if err != nil {
+		switch {
+		case err != nil:
 			acctFailed = true
 			errs = append(errs, fmt.Sprintf("%s status: %v", shortUID(st.UID), err))
-		} else if !checkedIn && enable {
-			if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
-				acctFailed = true
-				errs = append(errs, fmt.Sprintf("%s claim: %v", shortUID(st.UID), err))
-			} else {
-				ok++
-				counted = true
-				log.Printf("checkin %s: ok", st.UID)
-			}
-		} else if checkedIn {
+		case checkedIn:
 			// 已签到（人工在 TRAE 端签过，或此前任务已领取）→ 不重复领取，单独计数并记录原因
 			already++
-			counted = true
 			log.Printf("checkin %s: already checked in (manual or previous run)", st.UID)
+		case !enable:
+			// 上游关闭签到（活动未开放/账号不适用）：没有领取动作，如实计跳过而非成功
+			skipped++
+			log.Printf("checkin %s: checkin disabled by upstream (enable=false)", st.UID)
+		default:
+			gained, cerr := s.cfg.Upstream.CheckinClaim(a)
+			switch {
+			case cerr == nil:
+				ok++
+				log.Printf("checkin %s: ok (+%d credits)", st.UID, gained)
+			case upstream.IsAlreadyCheckedIn(cerr):
+				already++
+				log.Printf("checkin %s: already checked in (%v)", st.UID, cerr)
+			default:
+				// 领取报错后复查状态：超时等已实际领取的情况不应误报失败
+				if verified, _, _, verr := s.cfg.Upstream.CheckinStatus(a); verr == nil && verified {
+					already++
+					log.Printf("checkin %s: claim error but verified checked in: %v", st.UID, cerr)
+				} else {
+					acctFailed = true
+					msg := fmt.Sprintf("%s claim: %v", shortUID(st.UID), cerr)
+					if upstream.IsDeviceRejected(cerr) {
+						msg += "（领取要求该账号自己注册的设备，随机/共用设备会被拒）"
+					}
+					errs = append(errs, msg)
+				}
+			}
 		}
 		// 查积分 + 解冻
 		remain, err := s.cfg.Upstream.UserEntUsage(a)
@@ -277,10 +294,6 @@ func (s *Scheduler) doCheckin() (summary, result string) {
 		}
 		if acctFailed {
 			failed++
-			continue
-		}
-		if !counted {
-			ok++ // 无签到动作但全流程顺利（如上游关闭签到 enable=false）
 		}
 	}
 	return buildSummary(ok, already, failed, skipped, 0, errs), classify(ok+already, failed, skipped)

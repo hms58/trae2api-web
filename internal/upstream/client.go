@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -319,7 +320,55 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
+// CheckinError 签到/领取接口的业务错误：HTTP 200 但响应体 code != 0。
+// 上游把失败原因都放在 code 里（9074 设备风控/人数过多、9095 设备当日已被占用、
+// 1001 令牌失效、今日已签到等），只看 HTTP 状态会把失败当成功。
+type CheckinError struct {
+	Code    int    // 上游业务码
+	Message string // 上游 message 原文
+}
+
+func (e *CheckinError) Error() string {
+	return fmt.Sprintf("checkin code=%d: %s", e.Code, e.Message)
+}
+
+// 设备类业务码：9074 设备未登记/风控拒绝；9095 该设备当日已被其它账号占用。
+const (
+	codeCheckinDeviceRejected = 9074
+	codeCheckinDeviceOccupied = 9095
+)
+
+// IsAlreadyCheckedIn 判断错误是否为「今日已签到」：属于幂等结果，不计失败。
+func IsAlreadyCheckedIn(err error) bool {
+	var ce *CheckinError
+	if !errors.As(err, &ce) {
+		return false
+	}
+	return strings.Contains(ce.Message, "已签到") || strings.Contains(strings.ToLower(ce.Message), "already check")
+}
+
+// IsDeviceRejected 判断错误是否为设备校验拒绝（领取必须用该账号自己注册的设备）。
+func IsDeviceRejected(err error) bool {
+	var ce *CheckinError
+	if !errors.As(err, &ce) {
+		return false
+	}
+	return ce.Code == codeCheckinDeviceRejected || ce.Code == codeCheckinDeviceOccupied
+}
+
+// checkinCode 业务码判定：0（或响应缺省 code）视为成功。
+func checkinCode(code int, message string) error {
+	if code == 0 {
+		return nil
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "upstream business error"
+	}
+	return &CheckinError{Code: code, Message: message}
+}
+
 // CheckinStatus 查询签到状态。
+// code != 0 一律报错：否则失败响应会被读成「未签到 + 未开启」，调用方会当成无事可做。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -331,25 +380,63 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 		return false, 0, false, err
 	}
 	var resp struct {
-		CheckedIn bool  `json:"checked_in"`
-		Credits   int64 `json:"credits"`
-		Enable    bool  `json:"enable"`
+		Code      int    `json:"code"`
+		Message   string `json:"message"`
+		CheckedIn bool   `json:"checked_in"`
+		Credits   int64  `json:"credits"`
+		Enable    *bool  `json:"enable"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return false, 0, false, fmt.Errorf("checkin status parse: %w", err)
 	}
-	return resp.CheckedIn, resp.Credits, resp.Enable, nil
+	if err := checkinCode(resp.Code, resp.Message); err != nil {
+		return false, 0, false, err
+	}
+	// enable 缺省视为开启：上游只在签到活动关闭/不适用时才下发 false。
+	return resp.CheckedIn, resp.Credits, resp.Enable == nil || *resp.Enable, nil
 }
 
-// CheckinClaim 执行签到。
-func (c *Client) CheckinClaim(a *auth.Auth) error {
+// CheckinClaim 执行签到，返回本次获得的积分（上游未下发时为 0）。
+// 只有业务码 0 才算领取成功，失败一律返回 *CheckinError。
+func (c *Client) CheckinClaim(a *auth.Auth) (credits int64, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	UgHeaders(req, a)
-	_, err = c.doJSON(req)
-	return err
+	data, err := c.doJSON(req)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Credits float64         `json:"credits"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, fmt.Errorf("checkin claim parse: %w", err)
+	}
+	if err := checkinCode(resp.Code, resp.Message); err != nil {
+		return 0, err
+	}
+	if resp.Credits > 0 {
+		return int64(resp.Credits), nil
+	}
+	// 部分响应把本次奖励放在 data.points / data.credits 里；data 非对象时忽略。
+	var nested struct {
+		Credits float64 `json:"credits"`
+		Points  float64 `json:"points"`
+	}
+	if len(resp.Data) > 0 && json.Unmarshal(resp.Data, &nested) == nil {
+		if nested.Points > 0 {
+			return int64(nested.Points), nil
+		}
+		if nested.Credits > 0 {
+			return int64(nested.Credits), nil
+		}
+	}
+	return 0, nil
 }
 
 // UserEntUsage 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。
